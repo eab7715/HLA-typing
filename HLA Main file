@@ -1,0 +1,2801 @@
+#!/bin/bash
+
+set -uo pipefail
+
+# ── Script location (key file is saved here) ────────────────
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Defaults ────────────────────────────────────────────────
+OUTPUT_DIR="./hla_typing_output"
+SAMPLE_ID=""
+THREADS=4
+KEEP_INTERMEDIATE=false
+AUTO_PARSE=true
+CONVERSION_LOG=""
+
+OPTITYPE_DOCKER="fred2/optitype"
+OPTITYPE_LOCAL="/home/aboudreau/PanCancer_EV/CAIR/OptiType"
+CONFIG_FILE=""
+# HLA-LA removed — replaced by arcasHLA
+# HLA_LA_DIR and HLA_LA_GRAPH retained for backward compat only
+HLA_LA_DIR=""
+HLA_LA_GRAPH=""
+# arcasHLA: auto-detect from conda env if the hardcoded path is absent
+ARCASHLA_DIR="/home/aboudreau/arcasHLA"
+ARCASHLA_ENV="arcasHLA_env"
+
+
+# HLA-HD: paths to installation, dictionary (bowtie2 indexes), and frequency data
+HLAHD_DIR="/home/aboudreau/PanCancer_EV/CAIR/HLA_MODULE/hlahd.1.7.1"
+HLAHD_DICT_DIR="/home/aboudreau/PanCancer_EV/CAIR/HLA_MODULE/hlahd.1.7.1/dictionary"
+HLAHD_FREQ_DIR="/home/aboudreau/PanCancer_EV/CAIR/HLA_MODULE/hlahd.1.7.1/freq_data"
+MHC_MODE=""
+MHC1_TOOL=""
+MHC2_TOOL=""
+INPUT_R1=""
+INPUT_R2=""
+INPUT_BAM=""
+# Tracks whether the HLA-typing input was confirmed as a normal (germline)
+# or tumour sample.
+HLA_TYPING_INPUT_BAM=""  # set just before setup_lohhla runs, to preserve
+                          # the original HLA-typing BAM path before it gets
+                          # overwritten by tumour/normal BAM collection
+# Tracks whether the HLA-typing input was confirmed as germline or tumour.
+# Set by --normal-source / wizard.  Valid values:
+#   "normal"  — germline BAM/FASTQ (canonical, preferred)
+#   "tumour"  — somatic BAM/FASTQ (warn; may be corrupted by LOH/indels)
+#   "unknown" — not specified by user
+HLA_INPUT_SOURCE="unknown"
+
+# ── LOHHLA (LOH detection — requires tumour/normal pair) ─────
+LOHHLA_ENABLED=false
+LOHHLA_DIR="/home/aboudreau/PanCancer_EV/CAIR/lohhla-master"
+TUMOUR_BAM=""
+NORMAL_BAM=""
+HLA_FASTA=""          # polysolver-style HLA reference FASTA
+PURITY=""             # tumour purity estimate (optional, 0–1)
+PLOIDY=""             # tumour ploidy estimate (optional)
+CRAM_REF=""           # reference genome FASTA for CRAM decoding
+                      # required when any input file is .cram
+                      # must match the reference used for alignment
+PURPLE_SEGMENTS=""    # path to PURPLE copy-number segments file
+                      # (*.purple.cnv.somatic.tsv or *.cobalt.ratio.tsv)
+                      # when provided, enables --CopyNumLoc TRUE in LOHHLA
+                      # for copy-number-corrected LOH detection
+LOH_RUN_INDEX=1       # increments each time LOHHLA runs (1=preliminary, 2=definitive)
+
+# ── Colours ─────────────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; RESET='\033[0m'
+MAGENTA='\033[0;35m'
+
+# ── Core helpers ─────────────────────────────────────────────
+log()     { echo -e "${GREEN}[$(date +'%H:%M:%S')]${RESET} $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${RESET} $*"; }
+info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
+error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; exit 1; }
+header()  { echo -e "\n${BOLD}${CYAN}$*${RESET}"; }
+divider() { echo -e "${CYAN}──────────────────────────────────────────────────${RESET}"; }
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+# ════════════════════════════════════════════════════════════
+#  AUDIT TRAIL  — tamper-evident, SHA-256 chained log
+# ════════════════════════════════════════════════════════════
+
+AUDIT_LOG=""
+_PREV_HASH="0000000000000000000000000000000000000000000000000000000000000000"
+
+_tool_version() {
+    local t="$1"
+    command_exists "$t" && { "$t" --version 2>&1 | head -n 1; return; }
+    echo "not_found"
+}
+
+_file_checksum() {
+    local f="$1"
+    [[ -f "$f" ]] && sha256sum "$f" | awk '{print $1}' || echo "N/A"
+}
+
+audit_entry() {
+    [[ -z "$AUDIT_LOG" ]] && return
+    local event="$1"; shift
+    local ts; ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+
+    local payload
+    payload=$(printf '{"ts":"%s","event":"%s","pid":%s' "$ts" "$event" "$$")
+    for kv in "$@"; do
+        local k="${kv%%=*}" v="${kv#*=}"
+        payload+=",\"${k}\":\"${v}\""
+    done
+    payload+="}"
+
+    local chain_input="${_PREV_HASH}${payload}"
+    local new_hash; new_hash=$(printf '%s' "$chain_input" | sha256sum | awk '{print $1}')
+    _PREV_HASH="$new_hash"
+
+    printf '%s | chain=%s\n' "$payload" "$new_hash" >> "$AUDIT_LOG"
+}
+
+audit_file() {
+    local event="$1" filepath="$2"
+    local csum; csum=$(_file_checksum "$filepath")
+    local size="N/A"
+    [[ -f "$filepath" ]] && size=$(wc -c < "$filepath" | tr -d ' ')
+    audit_entry "$event" \
+        "file=$(basename "$filepath")" \
+        "path=$filepath" \
+        "sha256=$csum" \
+        "bytes=$size"
+}
+
+audit_tool() {
+    local toolname="$1"
+    local ver; ver=$(_tool_version "$toolname")
+    audit_entry "TOOL_VERSION" "tool=$toolname" "version=$ver"
+}
+
+audit_verify() {
+    [[ ! -f "$AUDIT_LOG" ]] && warn "No audit log found at $AUDIT_LOG" && return 1
+    local prev="0000000000000000000000000000000000000000000000000000000000000000"
+    local line_no=0 ok=true
+    while IFS= read -r line; do
+        (( line_no++ ))
+        local payload; payload="${line% | chain=*}"
+        local recorded_hash; recorded_hash="${line##* | chain=}"
+        local computed; computed=$(printf '%s' "${prev}${payload}" | sha256sum | awk '{print $1}')
+        if [[ "$computed" != "$recorded_hash" ]]; then
+            echo -e "  ${RED}✗ AUDIT CHAIN BROKEN at line $line_no${RESET}" >&2
+            echo -e "  ${RED}  Expected: $computed${RESET}" >&2
+            echo -e "  ${RED}  Got:      $recorded_hash${RESET}" >&2
+            ok=false
+        fi
+        prev="$recorded_hash"
+    done < "$AUDIT_LOG"
+    if [[ "$ok" == true ]]; then
+        echo -e "  ${GREEN}✓ Audit chain intact — $line_no entries verified.${RESET}"
+    fi
+    [[ "$ok" == true ]]
+}
+
+conversion_log() {
+    [[ -n "$AUDIT_LOG" ]] && audit_entry "CONVERSION" "detail=$*"
+    [[ -n "$CONVERSION_LOG" ]] && echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" >> "$CONVERSION_LOG"
+}
+
+# ════════════════════════════════════════════════════════════
+#  CHECKPOINT  — partial-run recovery
+# ════════════════════════════════════════════════════════════
+
+CHECKPOINT_FILE=""
+
+checkpoint_init() {
+    CHECKPOINT_FILE="$SAMPLE_OUTPUT_DIR/.pipeline_checkpoint"
+    if [[ -f "$CHECKPOINT_FILE" ]]; then
+        warn "Checkpoint file found: $CHECKPOINT_FILE"
+        echo -e "  ${YELLOW}A previous run was interrupted. Completed stages:${RESET}"
+        cat "$CHECKPOINT_FILE" | sed 's/^/    /'
+        local resume
+        # In non-interactive mode (batch job, no TTY) auto-resume without prompting
+        if [[ ! -t 0 ]]; then
+            resume="y"
+            log "Non-interactive mode — auto-resuming from checkpoint."
+        else
+            read -rp "$(echo -e "${BOLD}  Resume from last checkpoint? [Y/n]: ${RESET}")" resume || true
+        fi
+        if [[ "$(echo "$resume" | tr '[:upper:]' '[:lower:]')" == "n" ]]; then
+            rm -f "$CHECKPOINT_FILE"
+            audit_entry "CHECKPOINT_CLEARED" "sample=$SAMPLE_ID"
+            log "Starting fresh (checkpoint cleared)."
+        else
+            audit_entry "CHECKPOINT_RESUME" "sample=$SAMPLE_ID"
+            log "Resuming from checkpoint."
+        fi
+    else
+        audit_entry "CHECKPOINT_INIT" "sample=$SAMPLE_ID"
+    fi
+}
+
+checkpoint_done() {
+    local stage="$1"
+    echo "$stage" >> "$CHECKPOINT_FILE"
+    audit_entry "CHECKPOINT_STAGE_DONE" "stage=$stage"
+}
+
+checkpoint_skip() {
+    local stage="$1"
+    [[ -f "$CHECKPOINT_FILE" ]] && grep -qxF "$stage" "$CHECKPOINT_FILE"
+}
+
+# ════════════════════════════════════════════════════════════
+#  RETRY LOGIC
+# ════════════════════════════════════════════════════════════
+
+retry() {
+    local max="$1" sleep_s="$2"; shift 2
+    local attempt=1
+    while (( attempt <= max )); do
+        if "$@"; then
+            [[ $attempt -gt 1 ]] && log "Succeeded on attempt $attempt."
+            return 0
+        fi
+        local rc=$?
+        if (( attempt < max )); then
+            warn "Attempt $attempt/$max failed (exit $rc). Retrying in ${sleep_s}s..."
+            audit_entry "RETRY" "attempt=$attempt" "max=$max" "cmd=$1" "rc=$rc"
+            sleep "$sleep_s"
+        fi
+        (( attempt++ ))
+    done
+    audit_entry "RETRY_EXHAUSTED" "cmd=$1" "max=$max"
+    return 1
+}
+
+# ════════════════════════════════════════════════════════════
+#  DEPENDENCY SYSTEM
+# ════════════════════════════════════════════════════════════
+
+REQUIRED_TOOLS=(samtools bwa bowtie2 seqtk python3)
+
+detect_pkg_manager() {
+    if command_exists mamba;   then echo "mamba"
+    elif command_exists conda; then echo "conda"
+    elif command_exists apt-get; then echo "apt"
+    else echo "none"
+    fi
+}
+
+install_tool() {
+    local tool="$1"
+    local mgr; mgr=$(detect_pkg_manager)
+    echo -e "\n  ${MAGENTA}Installing ${BOLD}${tool}${RESET}${MAGENTA} via ${mgr}...${RESET}"
+    case "$mgr" in
+        mamba) mamba install -y -c conda-forge -c bioconda "$tool" || { warn "mamba failed for $tool"; return 1; } ;;
+        conda) conda install -y -c conda-forge -c bioconda "$tool" || { warn "conda failed for $tool"; return 1; } ;;
+        apt)   sudo apt-get install -y "$tool"                      || { warn "apt failed for $tool";   return 1; } ;;
+        none)  warn "No package manager found. Install $tool manually."; return 1 ;;
+    esac
+    echo -e "  ${GREEN}✓ ${tool} installed.${RESET}"
+}
+
+check_all_dependencies() {
+    header "DEPENDENCY CHECK"
+    divider
+    local missing=()
+    for tool in "${REQUIRED_TOOLS[@]}"; do
+        if command_exists "$tool"; then
+            echo -e "  ${GREEN}✓${RESET}  $tool"
+        else
+            echo -e "  ${RED}✗${RESET}  $tool  ${YELLOW}(missing)${RESET}"
+            missing+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing[@]} -eq 0 ]]; then
+        echo -e "\n  ${GREEN}All dependencies satisfied.${RESET}"; return 0
+    fi
+
+    local mgr; mgr=$(detect_pkg_manager)
+    echo -e "\n  ${YELLOW}Missing: ${missing[*]}${RESET}"
+
+    if [[ "$mgr" == "none" ]]; then
+        echo -e "  ${RED}No package manager found (conda/mamba/apt).${RESET}"
+        echo -e "  Install manually, then re-run. See: https://docs.conda.io"
+        error "Cannot continue without required tools."
+    fi
+
+    if [[ ! -t 0 ]]; then
+        answer="y"
+        log "Non-interactive mode — auto-proceeding with tool installation via ${mgr}."
+    else
+        read -rp "$(echo -e "${BOLD}  Install all missing tools now via ${mgr}? [Y/n]: ${RESET}")" answer || true
+    fi
+    [[ "$(echo "$answer" | tr '[:upper:]' '[:lower:]')" == "n" ]] && error "Cannot continue without required tools."
+
+    local failed=()
+    for tool in "${missing[@]}"; do
+        install_tool "$tool" || failed+=("$tool")
+    done
+    [[ ${#failed[@]} -gt 0 ]] && error "Failed to install: ${failed[*]}. Please install manually."
+    echo -e "\n  ${GREEN}All dependencies ready.${RESET}"
+}
+
+require_tool() {
+    local tool="$1"
+    command_exists "$tool" && return 0
+    echo -e "\n  ${YELLOW}⚠  '${BOLD}${tool}${RESET}${YELLOW}' is not installed.${RESET}"
+    local mgr; mgr=$(detect_pkg_manager)
+    [[ "$mgr" == "none" ]] && error "'$tool' required but no package manager found."
+    if [[ ! -t 0 ]]; then ans="y"
+    else read -rp "$(echo -e "${BOLD}  Install ${tool} via ${mgr}? [Y/n]: ${RESET}")" ans || true
+    fi
+    [[ "$(echo "$ans" | tr '[:upper:]' '[:lower:]')" == "n" ]] && error "'$tool' is required. Aborting."
+    install_tool "$tool" || error "Failed to install '$tool'."
+}
+
+# ════════════════════════════════════════════════════════════
+#  FILE FORMAT DETECTION
+# ════════════════════════════════════════════════════════════
+
+detect_format() {
+    local f="$1"
+    local ext="${f##*.}"
+    local lower; lower=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+    case "$lower" in
+        fastq|fq)           echo "fastq";       return ;;
+        fa|fasta|fna|ffn)   echo "fasta";       return ;;
+        fai)                echo "fasta_index"; return ;;
+        bam)                echo "bam";         return ;;
+        cram)               echo "cram";        return ;;
+        sam)                echo "sam";         return ;;
+        sra)                echo "sra";         return ;;
+        gz)
+            # Trust filename before trying zcat (zcat may fail on GPFS)
+            local base; base=$(basename "$f" .gz | tr '[:upper:]' '[:lower:]')
+            if [[ "$base" == *.fastq || "$base" == *.fq ]]; then
+                echo "fastq_gz"; return
+            elif [[ "$base" == *.fa || "$base" == *.fasta ]]; then
+                echo "fasta_gz"; return
+            fi
+            local inner; inner=$(zcat "$f" 2>/dev/null | head -c 1 || true)
+            if   [[ "$inner" == "@" ]]; then echo "fastq_gz"
+            elif [[ "$inner" == ">" ]]; then echo "fasta_gz"
+            else echo "fastq_gz"  # default to fastq_gz if we can't peek
+            fi
+            return ;;
+    esac
+
+    local head; head=$(head -c 1 "$f" 2>/dev/null || true)
+    if   [[ "$head" == "@" ]]; then echo "fastq"
+    elif [[ "$head" == ">" ]]; then echo "fasta"
+    else echo "unknown"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  CONVERSION ENGINE
+# ════════════════════════════════════════════════════════════
+
+_ask_convert() {
+    local src="$1" dst="$2" label="$3" tool_desc="$4"
+    local fmt; fmt=$(detect_format "$src")
+    echo ""
+    echo -e "  ${YELLOW}⚠  Incompatible file format detected${RESET}"
+    echo -e "  ┌─────────────────────────────────────────────────"
+    echo -e "  │  ${BOLD}File provided :${RESET} $(basename "$src")"
+    echo -e "  │  ${BOLD}Detected as   :${RESET} $fmt"
+    echo -e "  │  ${BOLD}Required      :${RESET} $label"
+    echo -e "  │  ${BOLD}Will use      :${RESET} $tool_desc"
+    echo -e "  │  ${BOLD}Output saved  :${RESET} $(basename "$dst")  (same folder as input)"
+    echo -e "  └─────────────────────────────────────────────────"
+    if [[ ! -t 0 ]]; then
+        ans="y"
+        log "Non-interactive mode — auto-proceeding with conversion."
+    else
+        read -rp "$(echo -e "${BOLD}  Proceed with automatic conversion? [Y/n]: ${RESET}")" ans || true
+    fi
+    [[ "$(echo "$ans" | tr '[:upper:]' '[:lower:]')" == "n" ]] && error "Conversion declined. Cannot continue without compatible input."
+}
+
+_convert_fasta_to_fastq() {
+    local src="$1"
+    local dst="$(dirname "$src")/$(basename "${src%.*}").fastq"
+    _ask_convert "$src" "$dst" "FASTQ" "seqtk seq (assigns dummy quality scores, Phred '#'=2)"
+    require_tool seqtk
+    echo -e "  ${CYAN}Converting...${RESET}"
+    seqtk seq -F '#' "$src" > "$dst"
+    INPUT_R1="$dst"; INPUT_R2=""
+    conversion_log "FASTA→FASTQ: $src → $dst"
+    echo -e "  ${GREEN}✓ Done.${RESET}"
+    echo -e "  ${BOLD}Converted file :${RESET} $dst"
+    echo -e "  ${YELLOW}  ↳ Re-use this file next time to skip conversion.${RESET}\n"
+}
+
+_convert_bam_to_fastq() {
+    local src="$1"
+    local base="$(dirname "$src")/$(basename "${src%.*}")"
+    local r1="${base}_R1.fastq" r2="${base}_R2.fastq"
+    _ask_convert "$src" "$r1 + $r2" "FASTQ (paired)" "samtools sort -n + samtools fastq"
+    require_tool samtools
+    local sorted="${base}.namesorted.bam"
+    echo -e "  ${CYAN}Name-sorting BAM...${RESET}"
+    samtools sort -n -@ "$THREADS" "$src" -o "$sorted"
+    echo -e "  ${CYAN}Extracting FASTQ...${RESET}"
+    samtools fastq -@ "$THREADS" -1 "$r1" -2 "$r2" -0 /dev/null -s /dev/null -n "$sorted"
+    INPUT_R1="$r1"; INPUT_R2="$r2"
+    [[ "$KEEP_INTERMEDIATE" == false ]] && rm -f "$sorted"
+    conversion_log "BAM→FASTQ: $src → $r1 + $r2"
+    echo -e "  ${GREEN}✓ Done.${RESET}"
+    echo -e "  ${BOLD}Read 1 :${RESET} $r1"
+    echo -e "  ${BOLD}Read 2 :${RESET} $r2"
+    echo -e "  ${YELLOW}  ↳ Re-use these files next time to skip conversion.${RESET}\n"
+}
+
+_convert_fastq_to_bam() {
+    local src="$1"
+    local base="$(dirname "$src")/$(basename "${src%.*}")"
+    local dst="${base}.bam"
+    _ask_convert "$src" "$dst" "BAM" "bwa mem (align to reference) + samtools sort + index"
+    require_tool bwa; require_tool samtools
+    echo -e "\n  ${BOLD}A BWA-indexed reference genome is required for alignment.${RESET}"
+    local ref; ref=$(prompt_file "Reference genome FASTA path (e.g. GRCh38.fa)")
+    if [[ ! -f "${ref}.bwt" ]]; then
+        echo -e "  ${YELLOW}BWA index not found for: $ref${RESET}"
+        if [[ ! -t 0 ]]; then bi="y"
+        else read -rp "$(echo -e "${BOLD}  Build BWA index now? (~90 min for GRCh38) [Y/n]: ${RESET}")" bi || true
+        fi
+        [[ "$(echo "$bi" | tr '[:upper:]' '[:lower:]')" == "n" ]] && error "BWA index required. Aborting."
+        bwa index "$ref"
+        conversion_log "BWA index built: $ref"
+    fi
+    echo -e "  ${CYAN}Aligning with bwa mem...${RESET}"
+    local sam="${base}.sam"
+    if [[ -n "$INPUT_R2" ]]; then
+        bwa mem -t "$THREADS" "$ref" "$src" "$INPUT_R2" > "$sam" \
+            || error "bwa mem failed — check that your reference is correct and the FASTQ is valid."
+    else
+        bwa mem -t "$THREADS" "$ref" "$src" > "$sam" \
+            || error "bwa mem failed — check that your reference is correct and the FASTQ is valid."
+    fi
+    [[ ! -s "$sam" ]] && error "bwa mem produced an empty SAM file — alignment failed."
+    echo -e "  ${CYAN}Sorting and indexing BAM...${RESET}"
+    samtools sort -@ "$THREADS" "$sam" -o "$dst" \
+        || error "samtools sort failed."
+    samtools index "$dst" \
+        || error "samtools index failed."
+    [[ ! -f "$dst" ]] && error "BAM file was not created — conversion failed."
+    INPUT_BAM="$dst"
+    [[ "$KEEP_INTERMEDIATE" == false ]] && rm -f "$sam"
+    conversion_log "FASTQ→BAM: $src → $dst (ref: $ref)"
+    echo -e "  ${GREEN}✓ Done.${RESET}"
+    echo -e "  ${BOLD}BAM file :${RESET} $dst"
+    echo -e "  ${YELLOW}  ↳ Re-use this BAM next time to skip conversion.${RESET}\n"
+}
+
+_convert_sam_to_bam() {
+    local src="$1"
+    local dst="${src%.sam}.bam"
+    _ask_convert "$src" "$dst" "BAM" "samtools view + sort + index"
+    require_tool samtools
+    samtools view -bS "$src" | samtools sort -@ "$THREADS" -o "$dst"
+    samtools index "$dst"
+    INPUT_BAM="$dst"
+    conversion_log "SAM→BAM: $src → $dst"
+    echo -e "  ${GREEN}✓ Done. BAM: $dst${RESET}\n"
+}
+
+_convert_sra_to_fastq() {
+    local src="$1"
+    local base="$(dirname "$src")/$(basename "${src%.*}")"
+    _ask_convert "$src" "${base}_1.fastq" "FASTQ" "fasterq-dump (SRA Toolkit)"
+    require_tool fasterq-dump
+    fasterq-dump "$src" -O "$(dirname "$src")" --threads "$THREADS" --split-files
+    INPUT_R1="${base}_1.fastq"
+    INPUT_R2="${base}_2.fastq"
+    [[ ! -f "$INPUT_R2" ]] && INPUT_R2=""
+    conversion_log "SRA→FASTQ: $src → $INPUT_R1 ${INPUT_R2:-}"
+    echo -e "  ${GREEN}✓ Done.${RESET}"
+    echo -e "  ${BOLD}Read 1 :${RESET} $INPUT_R1"
+    [[ -n "$INPUT_R2" ]] && echo -e "  ${BOLD}Read 2 :${RESET} $INPUT_R2\n"
+}
+
+_ensure_bam_indexed() {
+    local bam="$1"
+    local ok=false
+    [[ -f "${bam}.bai" ]]        && ok=true
+    [[ -f "${bam%.bam}.bai" ]]   && ok=true
+    [[ -f "${bam}.crai" ]]       && ok=true
+    [[ -f "${bam%.cram}.crai" ]] && ok=true
+    if [[ "$ok" == false ]]; then
+        info "Index not found — indexing with samtools..."
+        require_tool samtools
+        samtools index "$bam"
+        conversion_log "Indexed: $bam"
+    fi
+}
+
+ensure_fastq() {
+    local raw="$1" ctx="$2"
+    local fmt; fmt=$(detect_format "$raw")
+    case "$fmt" in
+        fastq|fastq_gz)   INPUT_R1="$raw" ;;
+        fasta|fasta_gz)   _convert_fasta_to_fastq "$raw" ;;
+        bam|cram)         _convert_bam_to_fastq   "$raw" ;;
+        sam)              _convert_sam_to_bam "$raw"; _convert_bam_to_fastq "$INPUT_BAM" ;;
+        sra)              _convert_sra_to_fastq    "$raw" ;;
+        fasta_index)
+            echo -e "\n  ${YELLOW}⚠  .fai is an index file, not a sequence.${RESET}"
+            echo -e "  Please provide the corresponding .fa / .fasta / .bam file."
+            [[ ! -t 0 ]] && error "Unrecognised FASTQ format in non-interactive mode: $raw"
+            local fix; fix=$(prompt_file "Correct file path")
+            ensure_fastq "$fix" "$ctx" ;;
+        *)
+            echo -e "\n  ${RED}✗  Unrecognised format for: $(basename "$raw")${RESET}"
+            echo -e "  Accepted: .fastq .fastq.gz .fa .fasta .bam .cram .sam .sra"
+            [[ ! -t 0 ]] && error "Unrecognised input format in non-interactive mode: $raw"
+            local fix; fix=$(prompt_file "Please provide a compatible file")
+            ensure_fastq "$fix" "$ctx" ;;
+    esac
+}
+
+ensure_bam() {
+    local raw="$1" ctx="$2"
+    local fmt; fmt=$(detect_format "$raw")
+    case "$fmt" in
+        bam|cram)
+            INPUT_BAM="$raw"
+            _ensure_bam_indexed "$raw" ;;
+        sam)            _convert_sam_to_bam    "$raw" ;;
+        fastq|fastq_gz) INPUT_R1="$raw"; _convert_fastq_to_bam "$raw" ;;
+        fasta|fasta_gz) _convert_fasta_to_fastq "$raw"; _convert_fastq_to_bam "$INPUT_R1" ;;
+        fasta_index)
+            echo -e "\n  ${YELLOW}⚠  .fai is an index, not a sequence. Provide .fa or .bam.${RESET}"
+            [[ ! -t 0 ]] && error "Unrecognised BAM format in non-interactive mode: $raw"
+            local fix; fix=$(prompt_file "Correct file path")
+            ensure_bam "$fix" "$ctx" ;;
+        *)
+            echo -e "\n  ${RED}✗  Unrecognised format: $(basename "$raw")${RESET}"
+            [[ ! -t 0 ]] && error "Unrecognised input format in non-interactive mode: $raw"
+            local fix; fix=$(prompt_file "Please provide a .bam, .cram, .fastq, or .fa file")
+            ensure_bam "$fix" "$ctx" ;;
+    esac
+}
+
+# ════════════════════════════════════════════════════════════
+#  INTERACTIVE PROMPTS
+# ════════════════════════════════════════════════════════════
+
+prompt_value() {
+    local msg="$1" var
+    while true; do
+        read -rp "$(echo -e "${BOLD}  → ${msg}: ${RESET}")" var || true
+        [[ -n "$var" ]] && echo "$var" && return
+        echo -e "  ${RED}Value cannot be empty.${RESET}"
+    done
+}
+
+PICK_RESULT=""
+
+pick_option() {
+    local varname="$1" prompt="$2"; shift 2
+    local opts=("$@")
+    echo -e "\n${BOLD}  ${prompt}${RESET}"
+    local i
+    for i in "${!opts[@]}"; do
+        echo -e "    ${CYAN}$((i+1)))${RESET} ${opts[$i]}"
+    done
+    local choice=""
+    while true; do
+        read -rp "$(echo -e "${BOLD}  Enter number [1-${#opts[@]}]: ${RESET}")" choice || true
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#opts[@]} )); then
+            PICK_RESULT="${opts[$((choice-1))]}"
+            eval "$varname=\"\$PICK_RESULT\""
+            return 0
+        fi
+        echo -e "  ${RED}Invalid — enter 1 to ${#opts[@]}.${RESET}"
+    done
+}
+
+prompt_file() {
+    local msg="$1" optional="${2:-false}" path
+    [[ ! -t 0 ]] && { echo "[NON-INTERACTIVE] prompt_file called for: $msg" >&2; echo ""; return; }
+    while true; do
+        read -rp "$(echo -e "${BOLD}  → ${msg}: ${RESET}")" path || true
+        [[ -z "$path" ]] && { [[ "$optional" == "true" ]] && echo "" && return; echo -e "  ${RED}Cannot be empty.${RESET}"; continue; }
+        path="${path/#\~/$HOME}"
+        [[ -f "$path" ]] && echo "$path" && return
+        echo -e "  ${RED}File not found: $path${RESET}"
+    done
+}
+
+# ════════════════════════════════════════════════════════════
+#  INTERACTIVE SETUP
+# ════════════════════════════════════════════════════════════
+
+print_banner() {
+    clear
+    echo -e "${BOLD}${CYAN}"
+    echo "  ╔══════════════════════════════════════════════════╗"
+    echo "  ║          HLA TYPING PIPELINE  v3.5              ║"
+    echo "  ║     Neoantigen Vaccine Prep · pVACtools Ready    ║"
+    echo "  ║     Optional LOH-HLA detection via LOHHLA       ║"
+    echo "  ╚══════════════════════════════════════════════════╝"
+    echo -e "${RESET}"
+}
+
+interactive_setup() {
+    print_banner
+
+    header "STEP 1 · Sample Information"
+    divider
+    SAMPLE_ID=$(prompt_value "Sample ID (e.g. patient01)")
+    read -rp "$(echo -e "${BOLD}  → Threads [4]: ${RESET}")" _thr || true
+    THREADS="${_thr:-4}"
+
+    OUTPUT_DIR="$SCRIPT_DIR/HLA_${SAMPLE_ID}/hla_typing_output"
+    mkdir -p "$OUTPUT_DIR"
+    CONVERSION_LOG="$OUTPUT_DIR/conversions.log"
+    AUDIT_LOG="$OUTPUT_DIR/audit_trail.log"
+    echo "# HLA Pipeline Conversion Log — $(date)" > "$CONVERSION_LOG"
+    printf '# HLA Typing Pipeline Audit Trail\n# Started: %s\n# User: %s  Host: %s\n' \
+        "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${USER:-unknown}" "$(hostname)" > "$AUDIT_LOG"
+    audit_entry "PIPELINE_START" "version=3.5" "mode=interactive" \
+        "user=${USER:-unknown}" "host=$(hostname)"
+    for _t in samtools bwa bowtie2 python3 seqtk; do audit_tool "$_t"; done
+
+    check_all_dependencies
+
+    header "STEP 2 · Select MHC Class"
+    divider
+    local mode_choice
+    pick_option mode_choice "Which HLA classes do you want to type?" \
+        "MHC-I only  (HLA-A, B, C)" \
+        "MHC-II only (HLA-DR, DQ, DP)" \
+        "MHC-I + MHC-II (both)"
+
+    case "$mode_choice" in
+        "MHC-I only"*)     MHC_MODE="mhc1" ;;
+        "MHC-II only"*)    MHC_MODE="mhc2" ;;
+        "MHC-I + MHC-II"*) MHC_MODE="both" ;;
+    esac
+
+    if [[ "$MHC_MODE" == "mhc1" || "$MHC_MODE" == "both" ]]; then setup_mhc1; fi
+    if [[ "$MHC_MODE" == "mhc2" || "$MHC_MODE" == "both" ]]; then setup_mhc2; fi
+
+    # ── LOHHLA — always offered, clearly skipped if no pair ───
+    # Capture HLA typing input BAM now, before setup_lohhla
+    # overwrites INPUT_BAM with the tumour/normal collection.
+    # Used by germline source confirmation inside setup_lohhla.
+    HLA_TYPING_INPUT_BAM="${INPUT_BAM:-}"
+    setup_lohhla
+
+    # ── IMGT/HLA normalisation — always offered ───────────────
+    setup_imgt_normalisation
+
+    header "STEP FINAL · Confirm & Run"
+    divider
+    echo -e "  ${BOLD}Sample ID  :${RESET} $SAMPLE_ID"
+    echo -e "  ${BOLD}MHC Mode   :${RESET} $MHC_MODE"
+    [[ -n "$MHC1_TOOL" ]]         && echo -e "  ${BOLD}MHC-I Tool :${RESET} $MHC1_TOOL"
+    [[ -n "$MHC2_TOOL" ]]         && echo -e "  ${BOLD}MHC-II Tool:${RESET} $MHC2_TOOL"
+    # Remind user of DRB3/4/5 gap if they chose arcasHLA for MHC-II
+    if [[ "$MHC2_TOOL" == "arcasHLA" ]]; then
+        echo -e "  ${YELLOW}            ⚠  DRB3/DRB4/DRB5 will NOT be typed (arcasHLA limitation)${RESET}"
+    fi
+    # Remind user that HLA-E/F/G will be extracted if HLA-HD is in use
+    if [[ "$MHC1_TOOL" == "hlahd" ]]; then
+        echo -e "  ${CYAN}            ✓  HLA-E/F/G non-classical typing enabled (HLA-HD)${RESET}"
+    fi
+    [[ -n "$INPUT_R1"  ]]         && echo -e "  ${BOLD}Read 1     :${RESET} $INPUT_R1"
+    [[ -n "$INPUT_R2"  ]]         && echo -e "  ${BOLD}Read 2     :${RESET} $INPUT_R2"
+    [[ -n "$INPUT_BAM" ]]         && echo -e "  ${BOLD}BAM/CRAM   :${RESET} $INPUT_BAM"
+    if [[ "$LOHHLA_ENABLED" == true ]]; then
+        echo -e "  ${BOLD}LOHHLA     :${RESET} ${GREEN}enabled${RESET}"
+        echo -e "  ${BOLD}Tumour BAM :${RESET} $TUMOUR_BAM"
+        echo -e "  ${BOLD}Normal BAM :${RESET} $NORMAL_BAM"
+        echo -e "  ${BOLD}HLA FASTA  :${RESET} $HLA_FASTA"
+        [[ -n "$PURITY"   ]] && echo -e "  ${BOLD}Purity     :${RESET} $PURITY"
+        [[ -n "$PLOIDY"   ]] && echo -e "  ${BOLD}Ploidy     :${RESET} $PLOIDY"
+        [[ -n "$CRAM_REF" ]] && echo -e "  ${BOLD}CRAM ref   :${RESET} $CRAM_REF"
+    else
+        echo -e "  ${BOLD}LOHHLA     :${RESET} ${YELLOW}skipped (no tumour/normal pair)${RESET}"
+    fi
+    echo -e "  ${BOLD}HLA source :${RESET} ${HLA_INPUT_SOURCE}"
+    [[ "$HLA_INPUT_SOURCE" == "tumour"  ]] && echo -e "  ${RED}            ⚠  TUMOUR input for HLA typing — not recommended${RESET}"
+    [[ "$HLA_INPUT_SOURCE" == "unknown" ]] && echo -e "  ${YELLOW}            ⚠  Source not confirmed — check sample type${RESET}"
+    echo -e "  ${BOLD}IMGT ver   :${RESET} ${IMGT_HLA_VERSION}"
+    echo -e "  ${BOLD}Output Dir :${RESET} $OUTPUT_DIR"
+    echo ""
+    read -rp "$(echo -e "${BOLD}  Proceed? [Y/n]: ${RESET}")" confirm || true
+    [[ "$(echo "$confirm" | tr '[:upper:]' '[:lower:]')" == "n" ]] && echo "Aborted." && exit 0
+}
+
+
+setup_imgt_normalisation() {
+    header "STEP 5 · IMGT/HLA Normalisation"
+    divider
+    echo -e "  ${CYAN}OptiType, arcasHLA, and HLA-HD each bundle a different IMGT/HLA${RESET}"
+    echo -e "  ${CYAN}database release internally.  The same allele can carry a different${RESET}"
+    echo -e "  ${CYAN}4-field designation across releases, causing false discordances in${RESET}"
+    echo -e "  ${CYAN}the consensus engine.  This stage rewrites all allele files to a${RESET}"
+    echo -e "  ${CYAN}single canonical IMGT release using py-ard (NMDP Bio Solutions).${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Requires:${RESET}  pip install py-ard"
+    echo -e "  ${BOLD}Default:${RESET}   IMGT/HLA 3.51.0  (version code: 3510)"
+    echo ""
+
+    # Check whether py-ard is available right now.
+    # The package installs as "pyard" (import pyard) in newer releases
+    # and as "ard" (import ard) in older ones — try both.
+    # Also verify it is importable in the exact python3 on PATH,
+    # since conda/venv environments can shadow the system python.
+    local _pyard_ok=false _pyard_ver="unknown" _pyard_module=""
+    local _py; _py=$(command -v python3 2>/dev/null || echo "python3")
+    if "$_py" -c "import pyard; print(pyard.__version__)" 2>/dev/null; then
+        _pyard_ok=true
+        _pyard_module="pyard"
+        _pyard_ver=$("$_py" -c "import pyard; print(pyard.__version__)" 2>/dev/null || echo "unknown")
+    elif "$_py" -c "import ard; print(ard.__version__)" 2>/dev/null; then
+        _pyard_ok=true
+        _pyard_module="ard"
+        _pyard_ver=$("$_py" -c "import ard; print(ard.__version__)" 2>/dev/null || echo "unknown")
+    fi
+    if [[ "$_pyard_ok" == true ]]; then
+        echo -e "  ${GREEN}✓ py-ard is installed (module: ${_pyard_module}, version: ${_pyard_ver})${RESET}"
+        echo -e "  ${GREEN}  Python: ${_py}${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠  py-ard not found for: ${_py}${RESET}"
+        echo -e "  ${YELLOW}   Tried: import pyard  and  import ard — both failed.${RESET}"
+        echo -e "  ${YELLOW}   Install with:  pip install py-ard${RESET}"
+        echo -e "  ${YELLOW}   If using conda: conda install -c bioconda py-ard${RESET}"
+        echo -e "  ${YELLOW}   Make sure you install into the same environment as python3${RESET}"
+        echo -e "  ${CYAN}   Active python3: ${_py}${RESET}"
+        echo -e "  ${CYAN}   To verify: ${_py} -c 'import pyard; print(pyard.__version__)'${RESET}"
+        echo -e "  ${YELLOW}   Normalisation will be skipped at runtime if still absent.${RESET}"
+    fi
+    echo ""
+
+    read -rp "$(echo -e "${BOLD}  → IMGT/HLA version to target [${IMGT_HLA_VERSION}]: ${RESET}")" _imgt_ver || true
+    if [[ -n "$_imgt_ver" ]]; then
+        # Accept both dotted (3.51.0) and compact (3510) formats
+        # Compact format: strip dots and leading zeros per field → e.g. 3.51.0 → 3510
+        if [[ "$_imgt_ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            local maj min pat
+            IFS='.' read -r maj min pat <<< "$_imgt_ver"
+            IMGT_HLA_VERSION="${maj}${min}${pat}"
+            echo -e "  ${GREEN}✓ Converted dotted version ${_imgt_ver} → compact code ${IMGT_HLA_VERSION}${RESET}"
+        else
+            IMGT_HLA_VERSION="$_imgt_ver"
+        fi
+    fi
+    echo -e "  ${GREEN}✓ IMGT/HLA version set: ${IMGT_HLA_VERSION}${RESET}"
+    echo -e "  ${CYAN}  All per-tool allele files will be normalised to this release${RESET}"
+    echo -e "  ${CYAN}  before QC and pVACtools formatting.  Original files are backed${RESET}"
+    echo -e "  ${CYAN}  up with a .prenorm suffix in the output directory.${RESET}\n"
+    audit_entry "IMGT_VERSION_SET" "version=${IMGT_HLA_VERSION}" "mode=interactive"
+}
+
+setup_mhc1() {
+    header "STEP 3a · MHC-I Tool Selection"
+    divider
+    echo -e "  ${CYAN}Tool info:${RESET}"
+    echo -e "    ${BOLD}OptiType${RESET}  — DNA/RNA.  Best for MHC-I from WGS/WES/RNA.  Natively: FASTQ"
+    echo -e "    ${BOLD}arcasHLA${RESET} — RNA-seq graph-based. Best for RNA-seq. Natively: FASTQ"
+    echo -e "    ${BOLD}HLA-HD${RESET}   — DNA/RNA.  Best accuracy for WGS/WES (MHC-I + II). Natively: FASTQ"
+    echo -e "  ${YELLOW}  Any other format will be auto-converted.${RESET}\n"
+    echo -e "  ${CYAN}  Note: HLA-HD will also automatically extract non-classical${RESET}"
+    echo -e "  ${CYAN}  HLA-E, HLA-F, and HLA-G alleles for immune-escape flagging.${RESET}\n"
+
+    local tool_choice
+    pick_option tool_choice "Which MHC-I typing tool?" \
+        "OptiType  (DNA/RNA · recommended for WGS/WES/RNA-seq · natively: FASTQ)" \
+        "arcasHLA  (recommended for RNA-seq · natively: FASTQ)" \
+        "HLA-HD    (DNA/RNA · recommended for WGS/WES · covers MHC-I + II + HLA-E/F/G · natively: FASTQ)"
+
+    case "$tool_choice" in
+        "OptiType"*)
+            MHC1_TOOL="optitype"
+            _collect_and_ensure_fastq "MHC-I / OptiType"
+            _collect_optitype_install
+            ;;
+        "arcasHLA"*)
+            MHC1_TOOL="arcasHLA"
+            _collect_and_ensure_fastq "MHC-I / arcasHLA"
+            _collect_arcasHLA_install
+            ;;
+        "HLA-HD"*)
+            MHC1_TOOL="hlahd"
+            _collect_and_ensure_fastq "MHC-I / HLA-HD"
+            _collect_hlahd_install
+            echo -e "\n  ${GREEN}✓ HLA-HD selected — HLA-E, F, G will be extracted automatically${RESET}"
+            echo -e "  ${CYAN}  Results written to: ${SAMPLE_ID}_hlahd_nc_alleles.txt + HLA_NC_STATUS.json${RESET}"
+            echo -e "  ${CYAN}  These are NOT included in the pVACtools allele string (no supported${RESET}"
+            echo -e "  ${CYAN}  binding predictors) but are flagged for immune-escape annotation.${RESET}\n"
+            ;;
+    esac
+}
+
+setup_mhc2() {
+    header "STEP 3b · MHC-II Tool Selection"
+    divider
+    echo -e "  ${CYAN}Tool info:${RESET}"
+    echo -e "    ${BOLD}arcasHLA${RESET} — RNA-seq graph-based. Covers DRB1/DQA1/DQB1/DPA1/DPB1."
+    echo -e "             ${YELLOW}⚠  Does NOT cover DRB3, DRB4, DRB5.${RESET}"
+    echo -e "    ${BOLD}HLA-HD${RESET}   — DNA/RNA. Best accuracy for WGS/WES."
+    echo -e "             Covers DRB1/${BOLD}DRB3/DRB4/DRB5${RESET}/DQA1/DQB1/DPA1/DPB1."
+    echo -e ""
+    echo -e "  ${CYAN}  DRB3, DRB4, and DRB5 are present in ~80-90% of individuals${RESET}"
+    echo -e "  ${CYAN}  and contribute to MHC-II antigen presentation. Missing them${RESET}"
+    echo -e "  ${CYAN}  will produce incomplete neoantigen predictions for those loci.${RESET}"
+    echo -e "  ${YELLOW}  Note: If HLA-HD was selected for MHC-I, it will be reused here automatically.${RESET}\n"
+
+    # If HLA-HD already selected for MHC-I, reuse it for MHC-II automatically
+    if [[ "$MHC1_TOOL" == "hlahd" ]]; then
+        MHC2_TOOL="hlahd"
+        echo -e "  ${GREEN}✓ HLA-HD selected for MHC-I — reusing for MHC-II automatically.${RESET}"
+        echo -e "  ${GREEN}  DRB1/DRB3/DRB4/DRB5/DQA1/DQB1/DPA1/DPB1 will all be extracted.${RESET}"
+        return
+    fi
+
+    local tool_choice
+    pick_option tool_choice "Which MHC-II typing tool?" \
+        "arcasHLA  (RNA-seq · DRB1/DQA1/DQB1/DPA1/DPB1 only — missing DRB3/4/5)" \
+        "HLA-HD    (DNA/RNA · full coverage incl. DRB3/DRB4/DRB5 · recommended)"
+
+    case "$tool_choice" in
+        "arcasHLA"*)
+            MHC2_TOOL="arcasHLA"
+            echo -e "  ${YELLOW}⚠  arcasHLA selected for MHC-II.${RESET}"
+            echo -e "  ${YELLOW}   DRB3, DRB4, and DRB5 will NOT be typed.${RESET}"
+            echo -e "  ${YELLOW}   If your cohort includes patients who express these chains,${RESET}"
+            echo -e "  ${YELLOW}   their MHC-II neoantigen predictions will be incomplete.${RESET}"
+            echo -e "  ${YELLOW}   Consider HLA-HD if you have WGS/WES input available.${RESET}\n"
+            if [[ "$MHC_MODE" == "both" ]]; then
+                echo -e "  ${GREEN}✓ Reusing input files already provided for MHC-I.${RESET}"
+            elif [[ -n "$INPUT_BAM" ]]; then
+                echo -e "  ${GREEN}✓ Reusing BAM/CRAM already prepared above.${RESET}"
+            else
+                _collect_and_ensure_fastq "MHC-II / arcasHLA"
+            fi
+            if [[ -z "$ARCASHLA_DIR" ]]; then
+                _collect_arcasHLA_install
+            else
+                echo -e "  ${GREEN}✓ Reusing arcasHLA installation already configured above.${RESET}"
+            fi
+            ;;
+        "HLA-HD"*)
+            MHC2_TOOL="hlahd"
+            if [[ "$MHC_MODE" == "both" ]]; then
+                echo -e "  ${GREEN}✓ Reusing input files already provided for MHC-I.${RESET}"
+            elif [[ -n "$INPUT_BAM" ]]; then
+                echo -e "  ${GREEN}✓ Reusing BAM/CRAM already prepared above.${RESET}"
+            else
+                _collect_and_ensure_fastq "MHC-II / HLA-HD"
+            fi
+            if [[ -z "$HLAHD_DIR" ]]; then
+                _collect_hlahd_install
+            else
+                echo -e "  ${GREEN}✓ Reusing HLA-HD installation already configured above.${RESET}"
+            fi
+            ;;
+    esac
+}
+
+_collect_and_ensure_fastq() {
+    local ctx="$1"
+    echo -e "\n  ${BOLD}${ctx} · Input File${RESET}"
+    echo -e "  Provide your file in ${BOLD}any${RESET} supported format:"
+    echo -e "  .fastq  .fastq.gz  .fa  .fasta  .bam  .cram  .sam  .sra"
+    echo -e "  ${YELLOW}  Incompatible formats will be converted automatically.${RESET}\n"
+    local raw; raw=$(prompt_file "Input file path (Read 1 or single-end)")
+    ensure_fastq "$raw" "$ctx"
+    # Resolve to absolute path immediately
+    [[ -n "$INPUT_R1" ]] && INPUT_R1="$(realpath "$INPUT_R1" 2>/dev/null || echo "$INPUT_R1")"
+
+    if [[ -z "$INPUT_R2" ]]; then
+        local r2; r2=$(prompt_file "Read 2 / paired-end file (optional — Enter to skip)" true)
+        if [[ -n "$r2" ]]; then
+            local r2fmt; r2fmt=$(detect_format "$r2")
+            if [[ "$r2fmt" == "fastq" || "$r2fmt" == "fastq_gz" ]]; then
+                INPUT_R2="$(realpath "$r2" 2>/dev/null || echo "$r2")"
+            else
+                local saved="$INPUT_R1"
+                ensure_fastq "$r2" "$ctx R2"
+                INPUT_R2="$INPUT_R1"; INPUT_R1="$saved"
+            fi
+        fi
+    fi
+}
+
+_collect_and_ensure_bam() {
+    local ctx="$1"
+    echo -e "\n  ${BOLD}${ctx} · Input File${RESET}"
+    echo -e "  Provide your file in ${BOLD}any${RESET} supported format:"
+    echo -e "  .bam  .cram  .sam  .fastq  .fastq.gz  .fa  .fasta"
+    echo -e "  ${YELLOW}  Incompatible formats will be aligned/converted automatically.${RESET}\n"
+    local raw; raw=$(prompt_file "Input file path")
+    ensure_bam "$raw" "$ctx"
+}
+
+_collect_optitype_install() {
+    echo ""
+    local src_choice
+    pick_option src_choice "OptiType installation" \
+        "Docker  (auto-pull fred2/optitype)" \
+        "Local   (auto-detect)"
+
+    if [[ "$src_choice" == "Local"* ]]; then
+        OPTITYPE_LOCAL=$(prompt_value "Path to OptiType dir (containing OptiTypePipeline.py)")
+    fi
+
+    read -rp "$(echo -e "${BOLD}  → OptiType config file (optional, Enter to skip): ${RESET}")" cfg || true
+    [[ -n "$cfg" ]] && CONFIG_FILE="$cfg"
+}
+
+
+_collect_arcasHLA_install() {
+    # If hardcoded path is missing, try to find arcasHLA inside the conda env
+    if [[ ! -f "$ARCASHLA_DIR/arcasHLA" ]]; then
+        warn "arcasHLA not found at $ARCASHLA_DIR — searching conda env '${ARCASHLA_ENV}'..."
+        local conda_base; conda_base=$(conda info --base 2>/dev/null)
+        local env_bin="${conda_base}/envs/${ARCASHLA_ENV}/bin"
+        if [[ -f "${env_bin}/arcasHLA" ]]; then
+            ARCASHLA_DIR="/home/aboudreau/arcasHLA"
+            info "arcasHLA auto-detected at: $ARCASHLA_DIR"
+        else
+            local found; found=$(find "$HOME" /research /opt \
+                -name "arcasHLA" -type f 2>/dev/null | head -n 1 || true)
+            if [[ -n "$found" ]]; then
+                ARCASHLA_DIR="/home/aboudreau/arcasHLA"
+                info "arcasHLA auto-detected at: $ARCASHLA_DIR"
+            else
+                error "arcasHLA not found. Set ARCASHLA_DIR at the top of the script or install: conda install -n ${ARCASHLA_ENV} -c bioconda arcashla"
+            fi
+        fi
+    fi
+    if ! conda env list | grep -q "^${ARCASHLA_ENV}"; then
+        error "conda env '$ARCASHLA_ENV' not found. Run: conda create -n $ARCASHLA_ENV ..."
+    fi
+    echo -e "  ${GREEN}✓ arcasHLA found: $ARCASHLA_DIR${RESET}"
+    echo -e "  ${GREEN}✓ conda env: $ARCASHLA_ENV${RESET}"
+}
+
+_collect_hlahd_install() {
+    # Verify hlahd.sh binary exists
+    if [[ ! -f "$HLAHD_DIR/bin/hlahd.sh" ]]; then
+        local found; found=$(find "$HOME" /research /opt \
+            -name "hlahd.sh" -type f 2>/dev/null | head -n 1 || true)
+        if [[ -n "$found" ]]; then
+            HLAHD_DIR="$(dirname "$(dirname "$found")")"
+            info "HLA-HD auto-detected at: $HLAHD_DIR"
+        else
+            error "HLA-HD not found at $HLAHD_DIR/bin/hlahd.sh — set HLAHD_DIR at the top of the script."
+        fi
+    fi
+    # Verify dictionary has bowtie2 indexes
+    if [[ ! -d "$HLAHD_DICT_DIR" ]]; then
+        error "HLA-HD dictionary not found at $HLAHD_DICT_DIR — set HLAHD_DICT_DIR at the top of the script."
+    fi
+    local bt2_count; bt2_count=$(find "$HLAHD_DICT_DIR" -name "*.bt2" 2>/dev/null | wc -l)
+    if [[ "$bt2_count" -eq 0 ]]; then
+        error "HLA-HD dictionary at $HLAHD_DICT_DIR has no .bt2 index files — run build_hlahd_index.sh first."
+    fi
+    # Verify freq_data exists
+    if [[ ! -d "$HLAHD_FREQ_DIR" ]]; then
+        error "HLA-HD freq_data not found at $HLAHD_FREQ_DIR — set HLAHD_FREQ_DIR at the top of the script."
+    fi
+    echo -e "  ${GREEN}✓ HLA-HD found: $HLAHD_DIR/bin/hlahd.sh${RESET}"
+    echo -e "  ${GREEN}✓ Dictionary: $HLAHD_DICT_DIR (${bt2_count} .bt2 indexes)${RESET}"
+    echo -e "  ${GREEN}✓ Freq data: $HLAHD_FREQ_DIR${RESET}"
+}
+
+# ════════════════════════════════════════════════════════════
+#  TOOL RUNNERS
+# ════════════════════════════════════════════════════════════
+run_optitype() {
+    log "Running OptiType (MHC-I)..."
+
+    # NOTE: 'conda activate' does not work in non-interactive bash scripts.
+    # Use 'conda run -n <env>' instead — it spawns a subprocess in the correct env.
+
+    local out="$SAMPLE_OUTPUT_DIR/optitype"; mkdir -p "$out"
+
+    if [[ -n "$OPTITYPE_LOCAL" ]]; then
+        local cfg_arg=""; [[ -n "${CONFIG_FILE:-}" ]] && cfg_arg="-c $CONFIG_FILE"
+
+        local abs_r1; abs_r1=$(realpath "$INPUT_R1" 2>/dev/null || echo "$INPUT_R1")
+        local abs_r2=""; [[ -n "$INPUT_R2" ]] && abs_r2=$(realpath "$INPUT_R2" 2>/dev/null || echo "$INPUT_R2")
+        local abs_out; abs_out=$(realpath "$out" 2>/dev/null || echo "$out")
+        local input_args="-i $abs_r1"
+        [[ -n "$abs_r2" ]] && input_args="$input_args -i $abs_r2"
+
+        # Use the optitype binary directly from the conda env — avoids the
+        # 'No module named optitype' error that occurs when calling via python.
+        local optitype_bin="/home/aboudreau/.conda/envs/optitype_env/bin/optitype"
+        local cfg_arg2=""
+        [[ -n "${CONFIG_FILE:-}" ]] && cfg_arg2="--config $CONFIG_FILE"
+        conda run -n optitype_env \
+            "$optitype_bin" run \
+            $input_args --dna -o "$abs_out" --verbose $cfg_arg2 \
+            || error "OptiType failed. Check that optitype_env/bin/optitype works."
+    elif command_exists docker; then
+        local abs_in1 abs_in2 abs_out input_args
+        abs_in1=$(cd "$(dirname "$INPUT_R1")" && pwd)
+        abs_out=$(cd "$SAMPLE_OUTPUT_DIR" && pwd)
+        input_args="--input /data/input1/$(basename "$INPUT_R1")"
+
+        if [[ -n "$INPUT_R2" ]]; then
+            abs_in2=$(cd "$(dirname "$INPUT_R2")" && pwd)
+            input_args="$input_args /data/input2/$(basename "$INPUT_R2")"
+            docker run --rm --platform linux/amd64 \
+                -v "$abs_in1:/data/input1:ro" \
+                -v "$abs_in2:/data/input2:ro" \
+                -v "$abs_out:/data/output" \
+                "$OPTITYPE_DOCKER" \
+                $input_args --rna --outdir /data/output/optitype --verbose
+        else
+            docker run --rm --platform linux/amd64 \
+                -v "$abs_in1:/data/input1:ro" \
+                -v "$abs_out:/data/output" \
+                "$OPTITYPE_DOCKER" \
+                $input_args --rna --outdir /data/output/optitype --verbose
+        fi
+    else
+        error "OptiType: Docker unavailable and no local path set."
+    fi
+
+    local rd tsv
+    rd=$(find "$out" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -n 1)
+    if [[ -n "$rd" ]]; then
+        tsv=$(find "$rd" -name "*_result.tsv" 2>/dev/null | head -n 1)
+        if [[ -f "$tsv" ]]; then
+            cp "$tsv" "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_result.tsv"
+            extract_optitype_alleles "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_result.tsv" \
+                "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt"
+        fi
+        local pdf; pdf=$(find "$rd" -name "*.pdf" 2>/dev/null | head -n 1)
+        [[ -f "$pdf" ]] && cp "$pdf" "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_coverage.pdf"
+    fi
+    log "OptiType complete."
+}
+
+extract_optitype_alleles() {
+    local input="$1" output="$2"
+    { echo "# OptiType MHC-I — $SAMPLE_ID — $(date)"; echo ""
+      tail -n +2 "$input" | while IFS=$'\t' read -r _ a1 a2 b1 b2 c1 c2 _; do
+          echo "HLA-${a1}"; echo "HLA-${a2}"
+          echo "HLA-${b1}"; echo "HLA-${b2}"
+          echo "HLA-${c1}"; echo "HLA-${c2}"
+      done
+    } > "$output"
+}
+
+run_arcasHLA() {
+    log "Running arcasHLA (MHC-I + MHC-II)..."
+    log "DEBUG run_arcasHLA: INPUT_R1=${INPUT_R1:-EMPTY} INPUT_R2=${INPUT_R2:-EMPTY} INPUT_BAM=${INPUT_BAM:-EMPTY}"
+    [[ -z "$ARCASHLA_DIR" ]] && error "arcasHLA dir not set."
+    [[ ! -f "$ARCASHLA_DIR/arcasHLA" ]] && error "arcasHLA not found in $ARCASHLA_DIR"
+
+    mkdir -p "$SAMPLE_OUTPUT_DIR/arcasHLA_working"
+
+    local fq1 fq2
+
+    # Determine input type: BAM → extract first; FASTQ → genotype directly
+    if [[ -n "$INPUT_BAM" && -f "$INPUT_BAM" && -z "$INPUT_R1" ]]; then
+        log "arcasHLA: extracting HLA reads from BAM..."
+        conda run -n "$ARCASHLA_ENV" \
+            "$ARCASHLA_DIR/arcasHLA" extract \
+            "$INPUT_BAM" \
+            -o "$SAMPLE_OUTPUT_DIR/arcasHLA_working/" \
+            -t "$THREADS" -v
+        fq1="$SAMPLE_OUTPUT_DIR/arcasHLA_working/${SAMPLE_ID}.extracted.1.fq.gz"
+        fq2="$SAMPLE_OUTPUT_DIR/arcasHLA_working/${SAMPLE_ID}.extracted.2.fq.gz"
+        [[ ! -f "$fq1" ]] && error "arcasHLA extract failed — extracted FASTQ not found: $fq1"
+    elif [[ -n "$INPUT_R1" && -f "$INPUT_R1" ]]; then
+        log "arcasHLA: using FASTQ input directly..."
+        fq1="$(realpath "$INPUT_R1" 2>/dev/null || echo "$INPUT_R1")"
+        fq2="${INPUT_R2:+$(realpath "$INPUT_R2" 2>/dev/null || echo "$INPUT_R2")}"
+    else
+        error "arcasHLA requires either a BAM file or FASTQ input. None found."
+    fi
+
+    # Genotype
+    log "arcasHLA: genotyping..."
+    # Debug output
+    log "DEBUG: fq1=$fq1 fq2=${fq2:-EMPTY} outdir=$SAMPLE_OUTPUT_DIR/arcasHLA_working/"
+
+    # Detect single vs paired end
+    local paired_flag=""
+    if [[ -z "$fq2" || ! -f "$fq2" ]]; then
+        paired_flag="--single"
+        log "arcasHLA: single-end mode"
+    else
+        log "arcasHLA: paired-end mode"
+    fi
+
+    conda run -n "$ARCASHLA_ENV" \
+        "$ARCASHLA_DIR/arcasHLA" genotype \
+        "$fq1" ${fq2:+"$fq2"} \
+        -g A,B,C,DQA1,DQB1,DRB1 \
+        -o "$SAMPLE_OUTPUT_DIR/arcasHLA_working/" \
+        -t "$THREADS" -v ${paired_flag:+"$paired_flag"} \
+        || error "arcasHLA genotype command failed — check output above."
+
+    # arcasHLA names output by input filename, not sample ID — find it
+    local result
+    result=$(find "$SAMPLE_OUTPUT_DIR/arcasHLA_working/" -name "*.genotype.json" 2>/dev/null | head -1)
+    if [[ -f "$result" ]]; then
+        cp "$result" "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_result.json"
+        extract_arcasHLA_alleles "$result" \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt"
+    else
+        warn "arcasHLA result not found — check: $SAMPLE_OUTPUT_DIR/arcasHLA_working/"
+    fi
+    log "arcasHLA complete."
+}
+
+extract_arcasHLA_alleles() {
+    local input="$1" output="$2"
+    { echo "# arcasHLA (MHC-I + MHC-II) — $SAMPLE_ID — $(date)"; echo ""
+      python3 -c "
+import json, sys
+with open(sys.argv[1]) as f:
+    d = json.load(f)
+for gene, alleles in sorted(d.items()):
+    for a in alleles:
+        print('HLA-' + a)
+" "$input"
+    } > "$output"
+}
+
+run_hlahd() {
+    log "Running HLA-HD (MHC-I + MHC-II)..."
+    [[ -z "$HLAHD_DIR" ]]      && error "HLAHD_DIR not set."
+    [[ ! -f "$HLAHD_DIR/bin/hlahd.sh" ]] && error "hlahd.sh not found in $HLAHD_DIR/bin/"
+    [[ -z "$HLAHD_DICT_DIR" ]] && error "HLAHD_DICT_DIR not set."
+    [[ -z "$HLAHD_FREQ_DIR" ]] && error "HLAHD_FREQ_DIR not set."
+
+    # HLA-HD requires FASTQ input — ensure we have it
+    local fq1 fq2
+    if [[ -n "$INPUT_R1" && -f "$INPUT_R1" ]]; then
+        fq1="$(realpath "$INPUT_R1" 2>/dev/null || echo "$INPUT_R1")"
+        fq2="${INPUT_R2:+$(realpath "$INPUT_R2" 2>/dev/null || echo "$INPUT_R2")}"
+    else
+        error "HLA-HD requires FASTQ input. No FASTQ found — check input file conversion."
+    fi
+
+    local work_dir="$SAMPLE_OUTPUT_DIR/hlahd_working"
+    mkdir -p "$work_dir"
+
+    # Export HLA-HD bin/ to PATH so internal tools (stfr, pm_extract, etc.) are found
+    export PATH="$HLAHD_DIR/bin:$PATH"
+
+    log "HLA-HD: running genotyping (this may take 30-60 min for WGS)..."
+    bash "$HLAHD_DIR/bin/hlahd.sh"         -t "$THREADS"         -m 100         -f "$HLAHD_FREQ_DIR/"         "$fq1" ${fq2:+"$fq2"}         "$HLAHD_DIR/HLA_gene.split.txt"         "$HLAHD_DICT_DIR/"         "$SAMPLE_ID"         "$work_dir"         || error "HLA-HD failed — check $work_dir for logs."
+
+    local result="$work_dir/$SAMPLE_ID/result/${SAMPLE_ID}_final.result.txt"
+    if [[ ! -f "$result" ]]; then
+        error "HLA-HD result not found: $result — check $work_dir for errors."
+    fi
+
+    cp "$result" "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_final.result.txt"
+
+    # Extract MHC-I alleles (A, B, C)
+    extract_hlahd_alleles "$result"         "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt"         "mhc1"
+
+    # Extract MHC-II alleles (DRB1, DRB3/4/5, DQA1, DQB1, DPA1, DPB1)
+    extract_hlahd_alleles "$result"         "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_mhc2_alleles.txt"         "mhc2"
+
+    # Extract non-classical MHC-I alleles (E, F, G) — immune-escape flagging only,
+    # not forwarded to pVACtools.
+    extract_hlahd_alleles "$result"         "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_nc_alleles.txt"         "mhc_nc"
+    generate_nc_escape_flag         "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_nc_alleles.txt"
+
+    log "HLA-HD complete."
+}
+
+# ────────────────────────────────────────────────────────────
+#  NON-CLASSICAL HLA IMMUNE ESCAPE FLAG
+#  HLA-E presents signal-peptide-derived epitopes and acts as an
+#  inhibitory NK ligand (via NKG2A/CD94).  Loss or down-regulation
+#  is a documented tumour immune escape mechanism.  HLA-F/G have
+#  immunomodulatory roles (HLA-G is highly expressed in tumours).
+#  These alleles are NOT fed to pVACtools (no binding predictors)
+#  but are recorded in HLA_NC_STATUS.json for downstream immune-
+#  escape analysis and clinical annotation.
+# ────────────────────────────────────────────────────────────
+
+generate_nc_escape_flag() {
+    local nc_allele_file="$1"
+    local json_out="$SAMPLE_OUTPUT_DIR/HLA_NC_STATUS.json"
+
+    python3 - "$nc_allele_file" "$json_out" "$SAMPLE_ID"         "${MHC1_TOOL:-unknown}" <<'NCEOF'
+import sys, os, json
+from datetime import datetime, timezone
+
+nc_allele_file, json_out, sample_id, hla_source = sys.argv[1:]
+
+def parse_nc_alleles(path):
+    alleles = {"E": [], "F": [], "G": []}
+    if not os.path.isfile(path):
+        return alleles
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            # Expected format: HLA-E*01:01:01:01 or E*01:01
+            for gene in ("E", "F", "G"):
+                if line.startswith(f"HLA-{gene}*") or line.startswith(f"{gene}*"):
+                    alleles[gene].append(line)
+    return alleles
+
+alleles = parse_nc_alleles(nc_allele_file)
+typed    = {g: v for g, v in alleles.items() if v}
+untyped  = [g for g, v in alleles.items() if not v]
+
+# Homozygosity check: if both alleles for a locus are identical it may
+# indicate LOH (or true homozygosity — cannot distinguish without copy
+# number, which LOHHLA provides for classical HLA only).
+hla_e_homozygous = (
+    len(alleles["E"]) == 2 and alleles["E"][0] == alleles["E"][1]
+)
+
+output = {
+    "sample_id":        sample_id,
+    "generated_utc":    datetime.now(timezone.utc).isoformat(),
+    "hla_source_tool":  hla_source,
+    "note": (
+        "Non-classical MHC-I alleles (E, F, G).  "
+        "HLA-E is an NK-cell inhibitory ligand via NKG2A/CD94; "
+        "LOH or silencing is a tumour immune escape route.  "
+        "These alleles are NOT included in the pVACtools --allele string "
+        "(no supported binding predictors) but should be reviewed for "
+        "immune-escape annotation in module 3."
+    ),
+    "alleles":           alleles,
+    "hla_e_possible_loh": hla_e_homozygous,
+    "untyped_genes":     untyped,
+    "escape_flags": {
+        "HLA_E_possible_LOH": hla_e_homozygous,
+        "HLA_E_not_typed":    len(alleles["E"]) == 0,
+        "HLA_F_not_typed":    len(alleles["F"]) == 0,
+        "HLA_G_not_typed":    len(alleles["G"]) == 0,
+    }
+}
+
+with open(json_out, "w") as fh:
+    json.dump(output, fh, indent=2)
+
+print(f"\n{'='*60}")
+print(f"  NON-CLASSICAL HLA STATUS  —  {sample_id}")
+print(f"{'='*60}")
+for gene in ("E", "F", "G"):
+    calls = alleles[gene] or ["— not typed"]
+    for c in calls:
+        print(f"  HLA-{gene}: {c}")
+if hla_e_homozygous:
+    print(f"  ⚠  HLA-E appears homozygous — possible LOH (confirm with LOHHLA/copy-number)")
+print(f"\n  Output: {json_out}")
+print(f"{'='*60}\n")
+NCEOF
+    [[ -f "$json_out" ]] &&         audit_file "OUTPUT_HLA_NC_STATUS" "$json_out"
+}
+
+extract_hlahd_alleles() {
+    local input="$1" output="$2" class="$3"
+    local mhc1_genes="A B C"
+    # DRB3/4/5 are present in ~80-90 % of individuals and contribute functionally
+    # to MHC-II antigen presentation; HLA-HD types them natively.
+    local mhc2_genes="DRB1 DRB3 DRB4 DRB5 DQA1 DQB1 DPA1 DPB1"
+    # Non-classical MHC-I: HLA-E presents signal-peptide-derived epitopes and is an
+    # NK-cell ligand; LOH at HLA-E is a documented immune escape mechanism.
+    # HLA-F/G have immunomodulatory roles in tumour immunology.
+    # NOT fed to pVACtools (no supported binding predictors) but extracted for
+    # immune-escape flagging and inclusion in HLA_LOH_STATUS.json.
+    local mhc_nc_genes="E F G"
+    local genes
+    case "$class" in
+        mhc1)   genes="$mhc1_genes"   ;;
+        mhc2)   genes="$mhc2_genes"   ;;
+        mhc_nc) genes="$mhc_nc_genes" ;;
+        *)      genes="$mhc1_genes"   ;;
+    esac
+
+    { echo "# HLA-HD ($class) — $SAMPLE_ID — $(date)"; echo ""
+      while IFS=$'\t' read -r gene allele1 allele2 rest; do
+          # Strip any trailing whitespace/CR that can appear in HLA-HD result files
+          gene="${gene%%[[:space:]]*}"
+          # HLA-HD writes ambiguous calls as tab-separated alternatives on one line
+          # (e.g. "B\tA*01:01\tA*01:02\tA*01:03") — take only the first call per field
+          allele1="${allele1%%$'\t'*}"
+          allele2="${allele2%%$'\t'*}"
+          for g in $genes; do
+              if [[ "$gene" == "$g" ]]; then
+                  [[ -n "$allele1" && "$allele1" != "-" && "$allele1" != "Not typed" ]] && echo "$allele1"
+                  [[ -n "$allele2" && "$allele2" != "-" && "$allele2" != "Not typed" ]] && echo "$allele2"
+              fi
+          done
+      done < "$input"
+    } > "$output"
+}
+
+# ════════════════════════════════════════════════════════════
+
+# ════════════════════════════════════════════════════════════
+#  IMGT/HLA NORMALISATION  (py-ard)
+#
+#  OptiType, arcasHLA, and HLA-HD each ship with a different IMGT/HLA
+#  database release.  The same allele can carry a different 4-field
+#  designation across releases, causing the consensus engine to score
+#  a false discordance.
+#
+#  This stage reads every per-tool allele file and rewrites alleles to
+#  a single canonical IMGT release using py-ard (NMDP Bio Solutions):
+#    pip install py-ard
+#
+#  If py-ard is not installed, the stage emits a WARN and skips
+#  gracefully — the rest of the pipeline is not blocked.
+#
+#  Pin the IMGT release with --imgt-version N (e.g. 3510 = 3.51.0).
+# ════════════════════════════════════════════════════════════
+
+IMGT_HLA_VERSION="${IMGT_HLA_VERSION:-3510}"  # default: IMGT/HLA 3.51.0
+
+normalise_alleles_imgt() {
+    header "IMGT/HLA NORMALISATION"
+    divider
+
+    # Require py-ard; skip gracefully if absent.
+    # The package installs as "pyard" in newer releases, "ard" in older ones.
+    local _pymod=""
+    if python3 -c "import pyard" 2>/dev/null; then
+        _pymod="pyard"
+    elif python3 -c "import ard" 2>/dev/null; then
+        _pymod="ard"
+    fi
+    if [[ -z "$_pymod" ]]; then
+        warn "py-ard not found (tried: import pyard, import ard) — skipping IMGT normalisation."
+        warn "Install with: pip install py-ard"
+        warn "Verify with:  python3 -c \"import pyard; print(pyard.__version__)\""
+        warn "Without normalisation, cross-tool consensus may score false discordances."
+        audit_entry "IMGT_NORM_SKIPPED" "reason=py-ard_not_installed"
+        return 0
+    fi
+
+    log "IMGT/HLA normalisation — target IMGT version: ${IMGT_HLA_VERSION}"
+    audit_entry "IMGT_NORM_START" "imgt_version=${IMGT_HLA_VERSION}"
+
+    # Collect every allele file produced for this sample
+    local files_to_normalise=()
+    local _f
+    for _f in \
+        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt"   \
+        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt"   \
+        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt"      \
+        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_mhc2_alleles.txt" \
+        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_nc_alleles.txt"
+    do
+        [[ -f "$_f" ]] && files_to_normalise+=("$_f")
+    done
+
+    if [[ ${#files_to_normalise[@]} -eq 0 ]]; then
+        warn "No allele files found to normalise — skipping."
+        return 0
+    fi
+
+    # Hand off to the embedded Python normaliser
+    local _out_dir="$SAMPLE_OUTPUT_DIR"
+    local _sid="$SAMPLE_ID"
+    local _ver="$IMGT_HLA_VERSION"
+    python3 /tmp/_hla_imgt_norm.py "$_ver" "$_out_dir" "$_sid" "${_pymod}" "${files_to_normalise[@]}"
+
+    local rpt="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_imgt_normalisation.json"
+    [[ -f "$rpt" ]] && audit_file "OUTPUT_IMGT_NORM_REPORT" "$rpt"
+    audit_entry "IMGT_NORM_COMPLETE" "imgt_version=${IMGT_HLA_VERSION}"
+    log "IMGT normalisation complete."
+}
+
+#  RESULT QC
+# ════════════════════════════════════════════════════════════
+
+QC_MIN_OPTITYPE_READS="${QC_MIN_OPTITYPE_READS:-10}"
+QC_MIN_COVERAGE="${QC_MIN_COVERAGE:-10}"
+QC_MIN_DEPTH="${QC_MIN_DEPTH:-5}"
+QC_REPORT=""
+
+_qc_header() {
+    QC_REPORT="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_qc_report.txt"
+    {
+        echo "# HLA Pipeline QC Report"
+        echo "# Sample   : $SAMPLE_ID"
+        echo "# Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+        echo "# ──────────────────────────────────────────────"
+    } > "$QC_REPORT"
+    audit_entry "QC_REPORT_INIT" "path=$QC_REPORT"
+}
+
+_qc_record() {
+    local status="$1" check="$2" detail="$3"
+    printf '  [%s] %s — %s\n' "$status" "$check" "$detail" | tee -a "$QC_REPORT"
+    audit_entry "QC_CHECK" "status=$status" "check=$check" "detail=$detail"
+}
+
+_qc_flag_ambiguous_alleles() {
+    # Checks each allele for:
+    #   < 2 fields  — below minimum for pVACtools (hard fail)
+    #   = 2 fields  — valid but warn: newer predictors (MHCflurry, MHCnuggets)
+    #                 work best at 4-field resolution; pVACtools will accept
+    #                 2-field but binding predictions may be less precise.
+    #   expression-variant suffix (N/Q/L/?) — low-confidence expression allele
+    local allele_file="$1" tool="$2"
+    [[ ! -f "$allele_file" ]] && return
+    local ambig_count=0 low_conf_count=0 two_field_count=0
+    while IFS= read -r allele; do
+        [[ -z "$allele" || "$allele" == \#* ]] && continue
+        if [[ "$allele" =~ [NQL?]$ ]]; then
+            _qc_record "WARN" "LOW_CONFIDENCE_ALLELE[$tool]" "$allele (expression-variant suffix)"
+            (( low_conf_count++ ))
+        fi
+        local fields; fields=$(echo "$allele" | tr ':' '\n' | grep -c '.' || true)
+        if (( fields < 2 )); then
+            _qc_record "FAIL" "ALLELE_RESOLUTION[$tool]"                 "$allele — below 2-field minimum, pVACtools will reject this allele"
+            (( ambig_count++ ))
+        elif (( fields == 2 )); then
+            _qc_record "WARN" "ALLELE_RESOLUTION[$tool]"                 "$allele — 2-field only. pVACtools accepts this but MHCflurry/MHCnuggets predict best at 4-field. Consider HLA-HD or arcasHLA for higher resolution."
+            (( two_field_count++ ))
+        fi
+    done < "$allele_file"
+    if (( ambig_count == 0 && low_conf_count == 0 && two_field_count == 0 )); then
+        _qc_record "PASS" "ALLELE_RESOLUTION[$tool]" "All alleles ≥ 4-field resolution"
+    elif (( ambig_count == 0 && low_conf_count == 0 )); then
+        _qc_record "WARN" "ALLELE_RESOLUTION[$tool]"             "${two_field_count} allele(s) at 2-field only — acceptable but suboptimal for newer predictors"
+    fi
+}
+
+_qc_optitype_coverage() {
+    local tsv="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_result.tsv"
+    [[ ! -f "$tsv" ]] && _qc_record "SKIP" "OPTITYPE_COVERAGE" "result TSV not found" && return
+
+    local reads objective
+    reads=$(awk 'NR==2{print $9}' "$tsv" 2>/dev/null || echo "0")
+    objective=$(awk 'NR==2{print $10}' "$tsv" 2>/dev/null || echo "0")
+
+    if (( $(echo "$reads < $QC_MIN_OPTITYPE_READS" | bc -l 2>/dev/null || echo 1) )); then
+        _qc_record "FAIL" "OPTITYPE_MIN_READS" \
+            "Mapped HLA reads=${reads} < threshold=${QC_MIN_OPTITYPE_READS} — results unreliable"
+    else
+        _qc_record "PASS" "OPTITYPE_MIN_READS" "Mapped reads=${reads} ≥ ${QC_MIN_OPTITYPE_READS}"
+    fi
+    _qc_record "INFO" "OPTITYPE_OBJECTIVE_SCORE" "objective=${objective}"
+}
+
+_qc_bam_hla_depth() {
+    local bam="$1"
+    [[ ! -f "$bam" ]] && _qc_record "SKIP" "BAM_HLA_DEPTH" "BAM not found" && return
+    command_exists samtools || { _qc_record "SKIP" "BAM_HLA_DEPTH" "samtools not available"; return; }
+
+    # CRAM files require a reference genome for samtools to decode them.
+    # Build a -T flag when the file is .cram and CRAM_REF is set.
+    # If CRAM_REF is unset and the file is .cram, warn and skip depth check.
+    local cram_flag=""
+    if [[ "${bam,,}" == *.cram ]]; then
+        if [[ -n "$CRAM_REF" && -f "$CRAM_REF" ]]; then
+            cram_flag="-T $CRAM_REF"
+        else
+            _qc_record "WARN" "BAM_HLA_DEPTH" \
+                "Input is CRAM but --cram-ref not provided — skipping depth check. Re-run with --cram-ref <ref.fa>"
+            return
+        fi
+    fi
+
+    local region="chr6:28510120-33480577"
+    local mean_depth
+    # shellcheck disable=SC2086
+    mean_depth=$(samtools depth -r "$region" $cram_flag "$bam" 2>/dev/null \
+        | awk '{sum+=$3; n++} END{if(n>0) printf "%.1f", sum/n; else print "0"}')
+
+    if [[ -z "$mean_depth" || "$mean_depth" == "0" ]]; then
+        region="6:28510120-33480577"
+        # shellcheck disable=SC2086
+        mean_depth=$(samtools depth -r "$region" $cram_flag "$bam" 2>/dev/null \
+            | awk '{sum+=$3; n++} END{if(n>0) printf "%.1f", sum/n; else print "0"}')
+    fi
+
+    local depth_int; depth_int=${mean_depth%.*}
+    if (( depth_int < QC_MIN_DEPTH )); then
+        _qc_record "FAIL" "HLA_REGION_DEPTH" \
+            "Mean depth=${mean_depth}× at MHC region < threshold=${QC_MIN_DEPTH}× — low confidence"
+    elif (( depth_int < QC_MIN_COVERAGE )); then
+        _qc_record "WARN" "HLA_REGION_DEPTH" \
+            "Mean depth=${mean_depth}× < recommended ${QC_MIN_COVERAGE}× — consider deeper sequencing"
+    else
+        _qc_record "PASS" "HLA_REGION_DEPTH" "Mean depth=${mean_depth}× ≥ ${QC_MIN_COVERAGE}×"
+    fi
+}
+
+_qc_expected_allele_count() {
+    local allele_file="$1" tool="$2" expected_min="$3"
+    [[ ! -f "$allele_file" ]] && return
+    local count
+    count=$(grep -c -v '^\(#\|$\)' "$allele_file" 2>/dev/null || echo 0)
+    if (( count < expected_min )); then
+        _qc_record "WARN" "ALLELE_COUNT[$tool]" \
+            "Only $count alleles found — expected at least $expected_min. Check tool output."
+    else
+        _qc_record "PASS" "ALLELE_COUNT[$tool]" "$count alleles reported"
+    fi
+}
+
+run_qc() {
+    header "RESULT QC"
+    divider
+    _qc_header
+
+    if [[ "$MHC_MODE" == "mhc1" || "$MHC_MODE" == "both" ]] && [[ "$MHC1_TOOL" == "optitype" ]]; then
+        _qc_optitype_coverage
+        _qc_flag_ambiguous_alleles \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt" "OptiType"
+        _qc_expected_allele_count \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt" "OptiType" 6
+    fi
+
+    if [[ "$MHC1_TOOL" == "arcasHLA" || "$MHC2_TOOL" == "arcasHLA" ]]; then
+        [[ -n "$INPUT_BAM" ]] && _qc_bam_hla_depth "$INPUT_BAM"
+        _qc_flag_ambiguous_alleles \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt" "arcasHLA"
+        _qc_expected_allele_count \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt" "arcasHLA" 6
+        # Check for single-end flag written during arcasHLA run
+        local _qc_flags="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_qc_flags.txt"
+        if [[ -f "$_qc_flags" ]] && grep -q "ARCASHLA_SINGLE_END=TRUE" "$_qc_flags" 2>/dev/null; then
+            _qc_record "WARN" "ARCASHLA_SINGLE_END" \
+                "arcasHLA ran in single-end mode — accuracy substantially reduced vs paired-end. Manual review recommended for all arcasHLA calls on this sample."
+        fi
+    fi
+
+    if [[ "$MHC1_TOOL" == "hlahd" || "$MHC2_TOOL" == "hlahd" ]]; then
+        [[ -n "$INPUT_BAM" ]] && _qc_bam_hla_depth "$INPUT_BAM"
+        _qc_flag_ambiguous_alleles \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt" "HLA-HD"
+        _qc_expected_allele_count \
+            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt" "HLA-HD" 6
+    fi
+
+    local fail_count warn_count
+    fail_count=$(grep -c '\[FAIL\]' "$QC_REPORT" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    warn_count=$(grep -c '\[WARN\]' "$QC_REPORT" 2>/dev/null | tr -d '[:space:]' || echo 0)
+    fail_count="${fail_count:-0}"
+    warn_count="${warn_count:-0}"
+    echo ""
+    echo -e "  ${BOLD}QC Summary:${RESET}  ${RED}${fail_count} FAIL${RESET}  ${YELLOW}${warn_count} WARN${RESET}"
+    echo -e "  Full report: $QC_REPORT"
+    audit_entry "QC_COMPLETE" \
+        "fail_count=$fail_count" "warn_count=$warn_count" "report=$QC_REPORT"
+
+    if (( fail_count > 0 )); then
+        warn "QC FAILURES detected — results may be unreliable. See $QC_REPORT"
+    fi
+}
+
+# ════════════════════════════════════════════════════════════
+#  LOHHLA — LOH-HLA DETECTION (optional, tumour/normal pair)
+# ════════════════════════════════════════════════════════════
+
+# Called from interactive_setup after MHC typing is configured.
+# Explains what LOHHLA does, checks if the user has what is needed,
+# and either configures the stage or clearly explains why it's skipped.
+setup_lohhla() {
+    header "STEP 4 · LOH-HLA Detection (LOHHLA) — Optional"
+    divider
+    echo -e "  ${CYAN}LOHHLA detects loss-of-heterozygosity at HLA loci in tumour DNA."
+    echo -e "  This can reveal immune escape mechanisms relevant for neoantigen vaccines.${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Requirements for LOHHLA:${RESET}"
+    echo -e "    • A ${BOLD}matched tumour BAM${RESET}  (WGS/WES, aligned)"
+    echo -e "    • A ${BOLD}matched normal BAM${RESET}  (same patient, germline)"
+    echo -e "    • A ${BOLD}HLA reference FASTA${RESET} (polysolver-style, e.g. from IMGT/HLA)"
+    echo -e "    • ${BOLD}R${RESET} with Bioconductor packages (Biostrings, BSgenome, etc.)"
+    echo -e "    • ${BOLD}LOHHLA${RESET} installation (script or conda)"
+    echo ""
+
+    # Check if a BAM was already provided (re-use or confirm it's tumour)
+    if [[ -n "$INPUT_BAM" ]]; then
+        echo -e "  ${YELLOW}ℹ  You already provided a BAM: $(basename "$INPUT_BAM")${RESET}"
+        echo -e "  LOHHLA needs to know if this is the ${BOLD}tumour${RESET} BAM and also needs the ${BOLD}normal${RESET} BAM."
+        echo ""
+    fi
+
+    local run_lohhla_choice
+    pick_option run_lohhla_choice "Do you have a tumour/normal BAM pair available for this sample?" \
+        "Yes — I have both tumour and normal BAMs (enable LOHHLA)" \
+        "No  — I only have a single BAM or no BAM pair (skip LOHHLA)"
+
+    if [[ "$run_lohhla_choice" == "No"* ]]; then
+        echo ""
+        echo -e "  ${YELLOW}⚠  LOHHLA skipped.${RESET}"
+        echo -e "  ${CYAN}To enable LOH-HLA detection in a future run, provide:${RESET}"
+        echo -e "    --tumour-bam  <tumour.bam>"
+        echo -e "    --normal-bam  <normal.bam>"
+        echo -e "    --hla-fasta   <hla_reference.fasta>"
+        echo ""
+        LOHHLA_ENABLED=false
+        return 0
+    fi
+
+    # ── Collect tumour BAM ────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}Tumour BAM${RESET}"
+    if [[ -n "$INPUT_BAM" ]]; then
+        local reuse_choice
+        pick_option reuse_choice "Use the BAM already provided as the tumour BAM?" \
+            "Yes — $(basename "$INPUT_BAM") is my tumour BAM" \
+            "No  — specify a different tumour BAM"
+        if [[ "$reuse_choice" == "Yes"* ]]; then
+            TUMOUR_BAM="$INPUT_BAM"
+            echo -e "  ${GREEN}✓ Tumour BAM: $TUMOUR_BAM${RESET}"
+        else
+            local raw_t; raw_t=$(prompt_file "Tumour BAM/CRAM path")
+            ensure_bam "$raw_t" "LOHHLA tumour"
+            TUMOUR_BAM="$INPUT_BAM"
+        fi
+    else
+        local raw_t; raw_t=$(prompt_file "Tumour BAM/CRAM path")
+        ensure_bam "$raw_t" "LOHHLA tumour"
+        TUMOUR_BAM="$INPUT_BAM"
+    fi
+
+    # ── Collect normal BAM ────────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}Normal BAM${RESET}"
+    local raw_n; raw_n=$(prompt_file "Matched normal BAM/CRAM path")
+    local saved_bam="$INPUT_BAM"
+    ensure_bam "$raw_n" "LOHHLA normal"
+    NORMAL_BAM="$INPUT_BAM"
+    INPUT_BAM="$saved_bam"   # restore so downstream stages still see the original BAM
+    echo -e "  ${GREEN}✓ Normal BAM: $NORMAL_BAM${RESET}"
+
+    # ── Germline source confirmation ──────────────────────
+    # IMPORTANT: by this point INPUT_BAM has been overwritten by
+    # the tumour/normal collection above. We must NOT use $INPUT_BAM
+    # to label the HLA typing input — it no longer points to the
+    # original HLA typing BAM/FASTQ.
+    #
+    # Instead, derive the label from INPUT_R1 (FASTQ path set earlier
+    # in the wizard by _collect_and_ensure_fastq) or, if the user
+    # provided a BAM for typing, from HLA_TYPING_INPUT_BAM which we
+    # capture below before this function is ever called.
+    #
+    # We also know the normal BAM they just provided ($NORMAL_BAM), so
+    # we can intelligently suggest "Normal" as the default and only ask
+    # if the HLA typing input does NOT match the normal BAM.
+    echo ""
+    echo -e "  ${BOLD}Germline Source Confirmation${RESET}"
+    echo -e "  ${CYAN}For clinical-grade HLA typing, alleles MUST be called from the${RESET}"
+    echo -e "  ${CYAN}germline (normal) BAM. Tumour BAMs may have LOH or somatic indels${RESET}"
+    echo -e "  ${CYAN}at HLA loci that corrupt allele calls and produce false results.${RESET}"
+    echo ""
+
+    # Derive the HLA typing input label from what was set BEFORE this function
+    local hla_typing_label
+    if [[ -n "$INPUT_R1" ]]; then
+        hla_typing_label="$(basename "$INPUT_R1")"
+        [[ -n "$INPUT_R2" ]] && hla_typing_label+=" + $(basename "$INPUT_R2")"
+    elif [[ -n "${HLA_TYPING_INPUT_BAM:-}" ]]; then
+        hla_typing_label="$(basename "$HLA_TYPING_INPUT_BAM")"
+    else
+        hla_typing_label="(set in earlier step — check wizard summary)"
+    fi
+    echo -e "  ${BOLD}Your HLA typing input: ${hla_typing_label}${RESET}"
+    echo -e "  ${BOLD}Normal BAM you just provided: $(basename "$NORMAL_BAM")${RESET}"
+    echo ""
+
+    # Smart default: if the HLA typing input matches the normal BAM
+    # (same basename), auto-confirm as normal without asking.
+    local normal_bn; normal_bn="$(basename "$NORMAL_BAM")"
+    if [[ "$hla_typing_label" == *"$normal_bn"* ]]; then
+        HLA_INPUT_SOURCE="normal"
+        echo -e "  ${GREEN}✓ HLA typing input matches normal BAM — automatically confirmed as germline.${RESET}\n"
+        audit_entry "GERMLINE_SOURCE_OK" "hla_input_source=normal" "auto_detected=true"
+    else
+        local src_choice
+        pick_option src_choice "Is your HLA typing input (${hla_typing_label}) a NORMAL or TUMOUR sample?" \
+            "Normal  — this is the matched germline / blood / normal sample (recommended)" \
+            "Tumour  — this is the tumour sample (NOT recommended for HLA typing)" \
+            "Unsure  — I do not know"
+        case "$src_choice" in
+            "Normal"*)
+                HLA_INPUT_SOURCE="normal"
+                echo -e "  ${GREEN}✓ Confirmed: HLA typing from germline — correct.${RESET}\n"
+                audit_entry "GERMLINE_SOURCE_OK" "hla_input_source=normal" ;;
+            "Tumour"*)
+                HLA_INPUT_SOURCE="tumour"
+                echo -e "  ${RED}⚠  CRITICAL: HLA typing input is the TUMOUR sample.${RESET}"
+                echo -e "  ${RED}   Tumour BAMs may have LOH or somatic indels at HLA loci${RESET}"
+                echo -e "  ${RED}   that corrupt allele calls. For clinical trial pipelines,${RESET}"
+                echo -e "  ${RED}   use the matched NORMAL BAM as your HLA typing input.${RESET}\n"
+                audit_entry "GERMLINE_SOURCE_CRITICAL" "hla_input_source=tumour" ;;
+            "Unsure"*)
+                HLA_INPUT_SOURCE="unknown"
+                echo -e "  ${YELLOW}⚠  Source not confirmed — flagged in audit trail.${RESET}"
+                echo -e "  ${YELLOW}   Strongly recommend confirming the sample type.${RESET}\n"
+                audit_entry "GERMLINE_SOURCE_WARN" "hla_input_source=unknown" ;;
+        esac
+    fi
+
+    # ── HLA reference FASTA ───────────────────────────────────
+    echo ""
+    echo -e "  ${BOLD}HLA Reference FASTA${RESET}"
+    echo -e "  ${CYAN}LOHHLA needs a per-allele HLA reference FASTA (polysolver format).${RESET}"
+    echo -e "  ${CYAN}These are typically named like: hla_all_v2.fasta (IMGT/HLA or polysolver bundle).${RESET}"
+    HLA_FASTA=$(prompt_file "HLA reference FASTA path")
+    echo -e "  ${GREEN}✓ HLA FASTA: $HLA_FASTA${RESET}"
+
+    # ── CRAM reference genome (required for CRAM decoding) ─────
+    echo ""
+    echo -e "  ${BOLD}CRAM Reference Genome${RESET} ${YELLOW}(required if any input file is .cram)${RESET}"
+    echo -e "  ${CYAN}samtools cannot decode CRAM files without the original reference FASTA.${RESET}"
+    echo -e "  ${CYAN}This must be the exact reference used for alignment (e.g. hg38.fa).${RESET}"
+    echo ""
+    # Detect if any provided file is CRAM
+    local needs_cram_ref=false
+    [[ "${TUMOUR_BAM,,}" == *.cram ]] && needs_cram_ref=true
+    [[ "${NORMAL_BAM,,}" == *.cram ]] && needs_cram_ref=true
+    [[ "${INPUT_BAM,,}"  == *.cram ]] && needs_cram_ref=true
+    if [[ "$needs_cram_ref" == true ]]; then
+        echo -e "  ${YELLOW}⚠  CRAM file detected — reference genome is REQUIRED.${RESET}"
+        CRAM_REF=$(prompt_file "Reference genome FASTA path (e.g. /refs/hg38.fa)")
+        echo -e "  ${GREEN}✓ CRAM reference: $CRAM_REF${RESET}\n"
+        audit_entry "CRAM_REF_SET" "ref=$(basename "$CRAM_REF")"
+    else
+        echo -e "  ${CYAN}No CRAM files detected — skipping (Enter to continue).${RESET}"
+        read -rp "$(echo -e "${BOLD}  → Reference genome FASTA [Enter to skip]: ${RESET}")" _cref || true
+        [[ -n "$_cref" ]] && CRAM_REF="$_cref" && echo -e "  ${GREEN}✓ CRAM reference set: $CRAM_REF${RESET}"
+    fi
+
+    # ── Purity / ploidy / PURPLE segments (optional) ──────────
+    echo ""
+    echo -e "  ${BOLD}Tumour Purity, Ploidy & PURPLE Segments${RESET}"
+    echo -e "  ${CYAN}Providing PURPLE copy-number segments enables copy-number-corrected${RESET}"
+    echo -e "  ${CYAN}LOH detection (--CopyNumLoc TRUE), which is substantially more${RESET}"
+    echo -e "  ${CYAN}accurate than allele-balance-only (the fallback).${RESET}"
+    echo ""
+    echo -e "  ${BOLD}Option A — PURPLE segments file${RESET} ${GREEN}(recommended)${RESET}"
+    echo -e "  ${CYAN}  Usually: <sample>.purple.cnv.somatic.tsv${RESET}"
+    echo -e "  ${YELLOW}  Note: PURPLE runs in module 2. If you have a prior PURPLE run,${RESET}"
+    echo -e "  ${YELLOW}  provide it here. Otherwise skip and re-run LOHHLA at module 3.${RESET}"
+    read -rp "$(echo -e "${BOLD}  → PURPLE segments file [Enter to skip]: ${RESET}")" _pseg || true
+    if [[ -n "$_pseg" && -f "$_pseg" ]]; then
+        PURPLE_SEGMENTS="$_pseg"
+        echo -e "  ${GREEN}✓ PURPLE segments: $PURPLE_SEGMENTS${RESET}"
+        echo -e "  ${GREEN}  --CopyNumLoc TRUE will be used — copy-number-corrected LOH${RESET}"
+        audit_entry "PURPLE_SEGMENTS_SET" "file=$(basename "$PURPLE_SEGMENTS")"
+    elif [[ -n "$_pseg" ]]; then
+        echo -e "  ${RED}✗  File not found: $_pseg — skipping PURPLE segments${RESET}"
+    else
+        echo -e "  ${YELLOW}  No PURPLE segments — LOHHLA will run allele-balance-only (preliminary).${RESET}"
+        echo -e "  ${YELLOW}  Re-run LOHHLA at the start of module 3 for the definitive result.${RESET}"
+    fi
+    echo ""
+    echo -e "  ${BOLD}Option B — Manual purity / ploidy${RESET} ${YELLOW}(optional, used if no PURPLE segments)${RESET}"
+    echo -e "  ${CYAN}  These can come from ASCAT, Sequenza, TITAN, or pathology reports.${RESET}"
+    read -rp "$(echo -e "${BOLD}  → Tumour purity [0–1, Enter to skip]: ${RESET}")" PURITY || true
+    read -rp "$(echo -e "${BOLD}  → Tumour ploidy [e.g. 2, Enter to skip]: ${RESET}")" PLOIDY || true
+    [[ -n "$PURITY" ]] && echo -e "  ${GREEN}✓ Purity: $PURITY${RESET}"
+    [[ -n "$PLOIDY" ]] && echo -e "  ${GREEN}✓ Ploidy: $PLOIDY${RESET}"
+    [[ -z "$PURITY" && -z "$PLOIDY" && -z "$PURPLE_SEGMENTS" ]] && \
+        echo -e "  ${YELLOW}  No purity/ploidy/PURPLE provided — allele-balance-only LOH.${RESET}"
+
+    # ── LOHHLA installation ───────────────────────────────────
+    echo ""
+    _collect_lohhla_install
+
+    LOHHLA_ENABLED=true
+    echo ""
+    echo -e "  ${GREEN}✓ LOHHLA configured. LOH-HLA detection will run after HLA typing.${RESET}"
+    audit_entry "LOHHLA_CONFIGURED" \
+        "tumour_bam=$(basename "$TUMOUR_BAM")" \
+        "normal_bam=$(basename "$NORMAL_BAM")" \
+        "hla_fasta=$(basename "$HLA_FASTA")" \
+        "purity=${PURITY:-unset}" \
+        "ploidy=${PLOIDY:-unset}"
+}
+
+_collect_lohhla_install() {
+    [[ -n "$LOHHLA_DIR" ]] && return 0
+    echo -e "  ${BOLD}LOHHLA Installation${RESET}"
+    # Try to find LOHHLA.R on the system first
+    local found=""
+    found=$(find "${CONDA_PREFIX:-}" "$HOME" /home/aboudreau/PanCancer_EV \
+        -name "LOHHLA.R" 2>/dev/null | head -n 1 || true)
+    [[ -z "$found" ]] && found=$(which LOHHLA.R 2>/dev/null || true)
+
+    if [[ -n "$found" ]]; then
+        LOHHLA_DIR="$(dirname "$found")"
+        echo -e "  ${GREEN}✓ LOHHLA found automatically: $LOHHLA_DIR${RESET}"
+        return 0
+    fi
+
+    echo -e "  ${YELLOW}LOHHLA not found on this system.${RESET}"
+    local choice=""
+    pick_option choice "How would you like to proceed?" \
+        "Auto-install LOHHLA (conda bioconda / GitHub clone)" \
+        "Specify path manually"
+
+    case "$choice" in
+        "Auto-install"*)
+            _auto_install_lohhla || {
+                warn "Auto-install failed. Falling back to manual path entry."
+                LOHHLA_DIR=$(prompt_value "Path to LOHHLA dir (containing LOHHLA.R)")
+            }
+            ;;
+        "Specify"*)
+            LOHHLA_DIR=$(prompt_value "Path to LOHHLA dir (containing LOHHLA.R)")
+            ;;
+    esac
+    [[ ! -f "$LOHHLA_DIR/LOHHLA.R" ]] && error "LOHHLA.R not found in $LOHHLA_DIR"
+}
+
+_auto_install_lohhla() {
+    header "LOHHLA AUTO-INSTALL"
+    divider
+    echo -e "  ${CYAN}Will attempt installation in this order:${RESET}"
+    echo -e "    1) conda / mamba  (bioconda)"
+    echo -e "    2) GitHub clone   (McGranahan lab)"
+    echo ""
+    if [[ ! -t 0 ]]; then ans="y"
+    else read -rp "$(echo -e "${BOLD}  Proceed with automatic install? [Y/n]: ${RESET}")" ans || true
+    fi
+    [[ "$(echo "$ans" | tr '[:upper:]' '[:lower:]')" == "n" ]] && return 1
+
+    local mgr; mgr=$(detect_pkg_manager)
+    if [[ "$mgr" == "mamba" || "$mgr" == "conda" ]]; then
+        info "Trying $mgr install of lohhla..."
+        "$mgr" install -y -c conda-forge -c bioconda lohhla 2>/dev/null && {
+            local f; f=$(find "${CONDA_PREFIX:-$HOME}" -name "LOHHLA.R" 2>/dev/null | head -n 1)
+            if [[ -n "$f" ]]; then LOHHLA_DIR="$(dirname "$f")"; log "LOHHLA → $LOHHLA_DIR"; return 0; fi
+        }
+        warn "conda/mamba install did not find LOHHLA.R — trying GitHub..."
+    fi
+
+    local dest="$HOME/tools/LOHHLA"
+    require_tool git
+    git clone --depth 1 https://github.com/McGranahanLab/LOHHLA.git "$dest" || return 1
+    [[ ! -f "$dest/LOHHLA.R" ]] && { warn "LOHHLA.R not found after clone."; return 1; }
+    LOHHLA_DIR="$dest"
+    log "LOHHLA cloned → $LOHHLA_DIR"
+}
+
+# Translate HLA alleles from pipeline format (HLA-A*02:01) to
+# LOHHLA/polysolver format (hla_a_02_01) for R script consumption.
+_normalise_alleles_for_lohhla() {
+    local allele_file="$1"
+    grep -v '^[#$]' "$allele_file" | grep -v '^$' | \
+    awk '{
+        gsub(/HLA-/, "hla_")
+        gsub(/\*/, "_")
+        gsub(/:/, "_")
+        print tolower($0)
+    }'
+}
+
+run_lohhla() {
+    [[ "$LOHHLA_ENABLED" != true ]] && return 0
+
+    log "Running LOHHLA (LOH-HLA detection)..."
+    local lohhla_script="$LOHHLA_DIR/LOHHLA.R"
+    [[ ! -f "$lohhla_script" ]] && error "LOHHLA.R not found at $lohhla_script"
+    command_exists Rscript || error "Rscript not found — install R (≥4.0) to use LOHHLA."
+
+    # ── Resolve allele file ───────────────────────────────────
+    local allele_file=""
+    if [[ -f "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt" ]]; then
+        allele_file="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_alleles.txt"
+    elif [[ -f "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt" ]]; then
+        allele_file="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_alleles.txt"
+    elif [[ -f "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt" ]]; then
+        allele_file="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_alleles.txt"
+    else
+        error "No HLA allele file found for LOHHLA — HLA typing must complete first."
+    fi
+
+    # ── Write normalised allele file for LOHHLA ───────────────
+    local lohhla_out="$SAMPLE_OUTPUT_DIR/lohhla"
+    mkdir -p "$lohhla_out"
+    local norm_alleles="$lohhla_out/${SAMPLE_ID}_lohhla_alleles.txt"
+    _normalise_alleles_for_lohhla "$allele_file" > "$norm_alleles"
+    info "Normalised alleles written: $norm_alleles"
+
+    # ── Ensure BAMs are indexed ────────────────────────────────
+    _ensure_bam_indexed "$TUMOUR_BAM"
+    _ensure_bam_indexed "$NORMAL_BAM"
+
+    # ── Auto-extract HLA region from BAMs (chr6:28000000-34000000) ──
+    local hla_region="chr6:28000000-34000000"
+    local tumour_hla_bam="$lohhla_out/${SAMPLE_ID}_tumor_HLA.bam"
+    local normal_hla_bam="$lohhla_out/${SAMPLE_ID}_normal_HLA.bam"
+    # Build samtools -T flag for CRAM input
+    local _cram_t=""
+    if [[ "${TUMOUR_BAM,,}" == *.cram || "${NORMAL_BAM,,}" == *.cram ]]; then
+        if [[ -n "$CRAM_REF" && -f "$CRAM_REF" ]]; then
+            _cram_t="-T $CRAM_REF"
+        else
+            error "CRAM input detected for LOHHLA but --cram-ref not provided.\n  CRAM files require a reference genome for samtools to decode.\n  Re-run with: --cram-ref <reference.fa>"
+        fi
+    fi
+    # Also detect non-chr contig naming (e.g. "6" vs "chr6")
+    local _t_header; _t_header=$(samtools view -H "$TUMOUR_BAM" ${_cram_t} 2>/dev/null | head -20)
+    if echo "$_t_header" | grep -q "SN:chr6"; then
+        hla_region="chr6:28000000-34000000"
+    elif echo "$_t_header" | grep -q "SN:6"; then
+        hla_region="6:28000000-34000000"
+    fi
+    info "HLA region: $hla_region"
+
+    if [[ ! -f "$tumour_hla_bam" ]]; then
+        info "Extracting HLA region from tumour BAM (this may take a few minutes)..."
+        # shellcheck disable=SC2086
+        samtools view -b ${_cram_t} "$TUMOUR_BAM" "$hla_region" > "$tumour_hla_bam"
+        samtools index "$tumour_hla_bam"
+        info "Tumour HLA region extracted."
+    else
+        info "Tumour HLA BAM already exists — reusing."
+    fi
+    if [[ ! -f "$normal_hla_bam" ]]; then
+        info "Extracting HLA region from normal BAM..."
+        # shellcheck disable=SC2086
+        samtools view -b ${_cram_t} "$NORMAL_BAM" "$hla_region" > "$normal_hla_bam"
+        samtools index "$normal_hla_bam"
+        info "Normal HLA region extracted."
+    else
+        info "Normal HLA BAM already exists — reusing."
+    fi
+    TUMOUR_BAM="$tumour_hla_bam"
+    NORMAL_BAM="$normal_hla_bam"
+
+    # ── Build Rscript argument string ─────────────────────────
+    local purity_arg="NA" ploidy_arg="NA"
+    [[ -n "$PURITY" ]] && purity_arg="$PURITY"
+    [[ -n "$PLOIDY" ]] && ploidy_arg="$PLOIDY"
+
+    info "Calling LOHHLA.R..."
+    local normal_sm loh_method copy_num_loc copy_num_arg
+    normal_sm="$SAMPLE_ID"
+
+    # ── CopyNumLoc: use PURPLE segments when available ────
+    # --CopyNumLoc FALSE  → allele-balance only (preliminary; no copy-number correction)
+    # --CopyNumLoc TRUE   → copy-number-corrected LOH (definitive; needs PURPLE segments)
+    #
+    # Option 2 strategy: LOHHLA runs twice.
+    #   Run 1 (module 1, LOH_RUN_INDEX=1): allele-balance only if no PURPLE segments
+    #                                       provided; copy-number-corrected if they are.
+    #   Run 2 (module 3, LOH_RUN_INDEX=2): always copy-number-corrected with PURPLE output.
+    #   The run-2 result supersedes run-1 in immune_escape.json.
+    if [[ -n "$PURPLE_SEGMENTS" && -f "$PURPLE_SEGMENTS" ]]; then
+        copy_num_loc="TRUE"
+        copy_num_arg="--CopyNumLoc $PURPLE_SEGMENTS"
+        loh_method="copy_number_corrected"
+        info "PURPLE segments provided — using copy-number-corrected LOH (--CopyNumLoc TRUE)"
+    else
+        copy_num_loc="FALSE"
+        copy_num_arg="--CopyNumLoc FALSE"
+        loh_method="allele_balance_only"
+        warn "No PURPLE segments — running allele-balance-only LOH (preliminary result)."
+        warn "Re-run at start of module 3 with --purple-segments for definitive result."
+    fi
+
+    # shellcheck disable=SC2086
+    Rscript "$lohhla_script" \
+        --patientId         "$normal_sm" \
+        --normalBAMfile     "$NORMAL_BAM" \
+        --tumorBAMfile      "$TUMOUR_BAM" \
+        --HLAfastaLoc       "$HLA_FASTA" \
+        --hlaPath           "$norm_alleles" \
+        $copy_num_arg \
+        --outputDir         "$lohhla_out" \
+        --mappingStep       TRUE \
+        --plottingStep      FALSE \
+        --minCoverageFilter 10 \
+        2>&1 | tee "$lohhla_out/${SAMPLE_ID}_lohhla_run${LOH_RUN_INDEX}.log" \
+        || { warn "LOHHLA.R exited non-zero — check $lohhla_out/${SAMPLE_ID}_lohhla_run${LOH_RUN_INDEX}.log"; }
+
+    # Store loh_method for generate_loh_json
+    export _LOH_METHOD="$loh_method"
+    export _LOH_RUN_INDEX="$LOH_RUN_INDEX"
+
+    # ── Parse results → HLA_LOH_STATUS.json ───────────────────
+    local loss_file
+    loss_file=$(find "$lohhla_out" -name "*HLAlossPrediction_CI.txt" 2>/dev/null | head -n 1)
+    generate_loh_json "$loss_file" "$allele_file" "$lohhla_out" "${_LOH_METHOD:-allele_balance_only}" "${_LOH_RUN_INDEX:-1}"
+
+    log "LOHHLA complete."
+}
+
+generate_loh_json() {
+    # ── Arguments ─────────────────────────────────────────────
+    # $1  loss_file      — LOHHLA HLAlossPrediction_CI.txt (may be empty string)
+    # $2  allele_file    — per-tool allele file used for this LOHHLA run
+    # $3  out_dir        — lohhla/ subdirectory
+    # $4  loh_method     — "allele_balance_only" | "copy_number_corrected"
+    # $5  run_index      — 1 (preliminary/module-1) | 2 (definitive/module-3)
+    #
+    # Output files:
+    #   HLA_LOH_STATUS.json          — full structured LOH object (always written)
+    #   immune_escape_stub.json      — module-3-ready stub (written on run 1 only)
+    #
+    # Schema version 2.0 changes vs 1.0:
+    #   • loh_detected is now a structured per-locus object, not a boolean
+    #   • LOH type: heterozygous_loss vs homozygous_loss vs diploid
+    #   • loh_method and run_index stamps for traceability
+    #   • superseded flag set to true when module 3 writes run 2
+    #   • immune_escape_stub.json interface for module 3
+    local loss_file="$1"
+    local allele_file="$2"
+    local out_dir="$3"
+    local loh_method="${4:-allele_balance_only}"
+    local run_index="${5:-1}"
+    local json_out="$SAMPLE_OUTPUT_DIR/HLA_LOH_STATUS.json"
+    local stub_out="$SAMPLE_OUTPUT_DIR/immune_escape_stub.json"
+
+    python3 - \
+        "$loss_file" "$allele_file" "$json_out" "$stub_out" \
+        "$SAMPLE_ID" "${MHC1_TOOL:-unknown}" \
+        "${PURITY:-null}" "${PLOIDY:-null}" \
+        "${PURPLE_SEGMENTS:-}" \
+        "$loh_method" "$run_index" \
+        "$HLA_INPUT_SOURCE" << 'PYEOF'
+import sys, os, json, re
+from datetime import datetime, timezone
+from collections import defaultdict
+
+(loss_file, allele_file, json_out, stub_out,
+ sample_id, hla_source,
+ purity_raw, ploidy_raw,
+ purple_segments,
+ loh_method, run_index_str,
+ hla_input_source) = sys.argv[1:]
+
+run_index = int(run_index_str)
+
+# ── Helpers ────────────────────────────────────────────────────
+
+def safe_float(v):
+    try:    return round(float(v), 6)
+    except: return None
+
+def parse_alleles(path):
+    if not os.path.isfile(path): return []
+    with open(path) as f:
+        return [l.strip() for l in f
+                if l.strip() and not l.startswith('#')]
+
+def extract_gene(allele):
+    """HLA-A*02:01 -> A"""
+    a = allele.strip()
+    bare = a[4:] if a.upper().startswith('HLA-') else a
+    return bare.split('*')[0] if '*' in bare else None
+
+def parse_lohhla_loss_table(path):
+    """
+    Parse LOHHLA HLAlossPrediction_CI.txt.
+    Returns dict: normalised_allele -> {
+        loh, copy_number, copy_number_ci_low, copy_number_ci_high,
+        pval, loh_type, raw_call
+    }
+    LOHHLA allele naming uses underscore format: hla_a_02_01_01_01
+    We normalise back to HLA-A*02:01 at 2-field for matching.
+    """
+    results = {}
+    if not os.path.isfile(path): return results
+    with open(path) as f:
+        raw = [l.rstrip('\n') for l in f if l.strip()]
+    if len(raw) < 2: return results
+
+    headers = [h.strip().lower() for h in raw[0].split('\t')]
+
+    def col(parts, *names):
+        for name in names:
+            for i, h in enumerate(headers):
+                if name.lower() in h and i < len(parts):
+                    v = parts[i].strip()
+                    return v if v not in ('', 'NA', 'na') else None
+        return None
+
+    for line in raw[1:]:
+        parts = line.split('\t')
+
+        # ── Allele name normalisation ──────────────────────────
+        raw_allele = col(parts,
+                         'hla_a_type1', 'lossallele', 'allele',
+                         'hla_type1', 'hla_type2')
+        if not raw_allele:
+            continue
+        # hla_a_02_01_01_01  →  HLA-A*02:01
+        m = re.match(r'hla_([a-z]+\d*)_(\d+)_(\d+)', raw_allele.lower())
+        if m:
+            gene   = m.group(1).upper()
+            field1 = m.group(2).zfill(2)
+            field2 = m.group(3).zfill(2)
+            allele_norm = f"HLA-{gene}*{field1}:{field2}"
+        else:
+            allele_norm = raw_allele
+
+        # ── Copy number ────────────────────────────────────────
+        cn      = safe_float(col(parts, 'mediancopynumber', 'copy', 'cn',
+                                 'copynumber', 'median_cn'))
+        cn_low  = safe_float(col(parts, 'ci_low', 'lower', 'cn_low'))
+        cn_high = safe_float(col(parts, 'ci_high', 'upper', 'cn_high'))
+        pval    = safe_float(col(parts, 'pval', 'p.val', 'p_val', 'pvalue',
+                                 'lossp', 'loss_pval'))
+
+        # ── LOH call ───────────────────────────────────────────
+        loh_raw = col(parts, 'hlaloss', 'lossallele', 'loss', 'loh')
+        if loh_raw is not None:
+            loh = str(loh_raw).strip().lower() in ('true', '1', 'yes', 'loss')
+        elif pval is not None:
+            loh = pval < 0.05
+        else:
+            loh = False
+
+        # ── LOH type: homozygous vs heterozygous ───────────────
+        # Homozygous loss: copy number < 0.5 (both copies gone)
+        # Heterozygous loss: 0.5 ≤ CN < 1.5 (one copy lost)
+        # Diploid: CN ≥ 1.5
+        if cn is not None:
+            if cn < 0.5:
+                loh_type = "homozygous_loss"
+            elif cn < 1.5 and loh:
+                loh_type = "heterozygous_loss"
+            else:
+                loh_type = "diploid"
+        else:
+            loh_type = "loss" if loh else "diploid_or_undetermined"
+
+        results[allele_norm] = {
+            "loh":               loh,
+            "loh_type":          loh_type,
+            "copy_number":       cn,
+            "copy_number_ci":    [cn_low, cn_high],
+            "pval":              pval,
+            "raw_lohhla_call":   loh_raw,
+        }
+
+    return results
+
+# ── Main parsing ───────────────────────────────────────────────
+
+alleles     = parse_alleles(allele_file)
+loh_results = parse_lohhla_loss_table(loss_file)
+loh_file_ok = os.path.isfile(loss_file) if loss_file else False
+
+purity_val  = safe_float(purity_raw)
+ploidy_val  = safe_float(ploidy_raw)
+
+# ── Build structured per-locus block ──────────────────────────
+# Group alleles by gene, then assign LOH status per locus
+# A locus has LOH if *either* allele is flagged as lost.
+gene_alleles = defaultdict(list)
+for a in alleles:
+    g = extract_gene(a)
+    if g:
+        gene_alleles[g].append(a)
+
+loci = {}
+for gene, gene_allele_list in gene_alleles.items():
+    gene_label = f"HLA-{gene}"
+    allele_details = {}
+    locus_loh      = False
+    locus_loh_type = "diploid"
+    lost_alleles   = []
+
+    for allele in gene_allele_list:
+        # Match against LOHHLA results by 2-field
+        two_f = allele
+        match = loh_results.get(allele)
+        if match is None:
+            # Try 2-field key
+            two_f_key = re.sub(r'\*(\d+):(\d+).*', r'*\1:\2', allele)
+            match = loh_results.get(two_f_key)
+        if match is None:
+            # Case-insensitive fallback
+            match = next((v for k, v in loh_results.items()
+                          if k.lower() == allele.lower()), None)
+
+        if match:
+            allele_details[allele] = match
+            if match["loh"]:
+                locus_loh = True
+                lost_alleles.append(allele)
+                # Worst-case LOH type wins for the locus
+                if match["loh_type"] == "homozygous_loss":
+                    locus_loh_type = "homozygous_loss"
+                elif (match["loh_type"] == "heterozygous_loss"
+                      and locus_loh_type != "homozygous_loss"):
+                    locus_loh_type = "heterozygous_loss"
+        else:
+            allele_details[allele] = {
+                "loh": None, "loh_type": "undetermined",
+                "copy_number": None, "copy_number_ci": [None, None],
+                "pval": None, "raw_lohhla_call": "not_in_lohhla_output"
+            }
+
+    loci[gene_label] = {
+        "status":       "LOH" if locus_loh else (
+                        "UNDETERMINED" if any(
+                            v["loh"] is None
+                            for v in allele_details.values()) else "DIPLOID"),
+        "loh_type":     locus_loh_type if locus_loh else "diploid",
+        "lost_alleles": lost_alleles,
+        "alleles":      allele_details,
+    }
+
+any_loh       = any(v["status"] == "LOH" for v in loci.values())
+all_loh_loci  = [g for g, v in loci.items() if v["status"] == "LOH"]
+hom_loh_loci  = [g for g, v in loci.items() if v["loh_type"] == "homozygous_loss"]
+
+# ── Overall immune escape risk (preliminary) ───────────────────
+# Module 3 overwrites this with B2M/TAP data; this is a placeholder.
+# HIGH: any homozygous loss
+# MEDIUM: any heterozygous loss
+# LOW: no LOH detected
+# UNKNOWN: LOHHLA didn't run or produce output
+if not loh_file_ok:
+    escape_risk = "UNKNOWN"
+elif hom_loh_loci:
+    escape_risk = "HIGH"
+elif any_loh:
+    escape_risk = "MEDIUM"
+else:
+    escape_risk = "LOW"
+
+# ── Write HLA_LOH_STATUS.json ──────────────────────────────────
+output = {
+    "schema_version":         "2.0",
+    "sample_id":              sample_id,
+    "generated_utc":          datetime.now(timezone.utc).isoformat(),
+    "hla_input_source":       hla_input_source,
+    "hla_source_tool":        hla_source,
+    "lohhla_ran":             loh_file_ok,
+    "loh_method":             loh_method,
+    "run_index":              run_index,
+    "superseded":             False,
+    "tumour_purity":          purity_val,
+    "tumour_ploidy":          ploidy_val,
+    "purple_segments_used":   os.path.basename(purple_segments) if purple_segments else None,
+    "any_loh_detected":       any_loh,
+    "loh_loci":               all_loh_loci,
+    "homozygous_loh_loci":    hom_loh_loci,
+    "preliminary_escape_risk": escape_risk,
+    "loci":                   loci,
+    "note": (
+        "PRELIMINARY result — allele-balance-only LOH (no PURPLE segments). "
+        "Re-run at start of module 3 with PURPLE copy-number segments for "
+        "definitive copy-number-corrected LOH. Module 3 will set superseded=true."
+        if loh_method == "allele_balance_only"
+        else "Copy-number-corrected LOH using PURPLE segments."
+    )
+}
+
+with open(json_out, 'w') as f:
+    json.dump(output, f, indent=2)
+
+# ── Write immune_escape_stub.json (run 1 only) ─────────────────
+# This defines the interface that module 3 must fill in.
+# Module 3 reads this stub, adds B2M/TAP1/TAP2/TAPBP status
+# from the somatic VCF, then writes the definitive immune_escape.json.
+# The stub is not written on run 2 (module 3 handles it directly).
+if run_index == 1:
+    stub = {
+        "schema_version":   "3.0",
+        "sample_id":        sample_id,
+        "generated_utc":    datetime.now(timezone.utc).isoformat(),
+        "status":           "STUB — awaiting module 3 completion",
+        "hla_loh": {
+            "method":             loh_method,
+            "run_index":          run_index,
+            "purple_purity":      purity_val,
+            "purple_ploidy":      ploidy_val,
+            "loci":               {
+                g: {
+                    "status":      v["status"],
+                    "loh_type":    v["loh_type"],
+                    "lost_alleles": v["lost_alleles"],
+                }
+                for g, v in loci.items()
+            },
+            "escape_flag":        any_loh,
+        },
+        "antigen_presentation": {
+            "_note": "To be populated by module 3 from somatic VCF",
+            "B2M":   {"status": "PENDING", "variant": None, "consequence": None},
+            "TAP1":  {"status": "PENDING", "variant": None, "consequence": None},
+            "TAP2":  {"status": "PENDING", "variant": None, "consequence": None},
+            "TAPBP": {"status": "PENDING", "variant": None, "consequence": None},
+        },
+        "overall_escape_risk": "PENDING — module 3 required",
+        "module3_instructions": (
+            "1. Re-run LOHHLA with PURPLE segments (--CopyNumLoc TRUE). "
+            "2. Parse B2M/TAP1/TAP2/TAPBP from consensus somatic VCF. "
+            "3. Set overall_escape_risk = HIGH/MEDIUM/LOW based on combined HLA-LOH + antigen-presentation status. "
+            "4. Write definitive immune_escape.json and set HLA_LOH_STATUS.json superseded=true."
+        )
+    }
+    with open(stub_out, 'w') as f:
+        json.dump(stub, f, indent=2)
+
+# ── Console summary ────────────────────────────────────────────
+w = 62
+print(f"\n{'='*w}")
+print(f"  HLA LOH STATUS  —  {sample_id}  [run {run_index}]")
+print(f"{'='*w}")
+print(f"  Method      : {loh_method}")
+print(f"  PURPLE used : {os.path.basename(purple_segments) if purple_segments else 'None (preliminary)'}")
+print(f"  Escape risk : {escape_risk}")
+print(f"{'─'*w}")
+if not loh_file_ok:
+    print(f"  ⚠  LOHHLA did not produce a loss file — check lohhla.log")
+else:
+    for gene_label, locus in loci.items():
+        sym  = "✗" if locus["status"] == "LOH" else (
+               "?" if locus["status"] == "UNDETERMINED" else "✓")
+        typ  = f"  [{locus['loh_type']}]" if locus["status"] == "LOH" else ""
+        lost = ""
+        if locus["lost_alleles"]:
+            lost = f"  lost: {', '.join(locus['lost_alleles'])}"
+        print(f"  {sym}  {gene_label:<12} {locus['status']}{typ}{lost}")
+if any_loh and loh_method == "allele_balance_only":
+    print(f"\n  ⚠  Preliminary result — no PURPLE segments.")
+    print(f"     Re-run at start of module 3 for definitive LOH calls.")
+print(f"\n  LOH_STATUS : {json_out}")
+if run_index == 1:
+    print(f"  ESCAPE_STUB: {stub_out}")
+print(f"{'='*w}\n")
+PYEOF
+    [[ -f "$json_out"  ]] && audit_file "OUTPUT_HLA_LOH_STATUS" "$json_out"
+    [[ -f "$stub_out"  ]] && audit_file "OUTPUT_IMMUNE_ESCAPE_STUB" "$stub_out"
+}
+
+
+# ════════════════════════════════════════════════════════════
+#  HLA ALLELE CONCORDANCE TABLE
+#  Produces a machine-readable per-allele TSV that module 3 can use
+#  to down-weight binding predictions for alleles that were discordant
+#  across tools.
+#
+#  Output: <sample_id>_hla_concordance.tsv
+#  Columns:
+#    gene          — locus (HLA-A, HLA-B, HLA-DRB1 …)
+#    allele_2field — 2-field canonical form used for voting
+#    allele_full   — highest-resolution call available across tools
+#    tools_called  — pipe-separated list of tools that called this allele
+#    n_tools_agree — count of tools in agreement
+#    n_tools_total — count of tools that typed this locus
+#    confidence    — HIGH (all agree) / MEDIUM (majority) / LOW (singleton)
+#    discordant    — TRUE / FALSE
+#    hla_input_source — germline/tumour/unknown (from HLA_INPUT_SOURCE)
+# ════════════════════════════════════════════════════════════
+
+generate_concordance_table() {
+    log "Generating HLA allele concordance table..."
+    local args=("$SAMPLE_OUTPUT_DIR" "$SAMPLE_ID" "$MHC_MODE" "$MHC1_TOOL" "$MHC2_TOOL" "$HLA_INPUT_SOURCE")
+    python3 /tmp/_hla_concordance.py "${args[@]}"
+    local tsv="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hla_concordance.tsv"
+    [[ -f "$tsv" ]] && audit_file "OUTPUT_HLA_CONCORDANCE" "$tsv"
+}
+
+# ════════════════════════════════════════════════════════════
+#  pVACtools FORMATTER
+# ════════════════════════════════════════════════════════════
+
+parse_for_pvactools() {
+    log "Formatting alleles for pVACtools..."
+
+    # ── Step 1: generate the per-allele concordance table ──────────────
+    # Runs before the consensus engine so the concordance TSV is available
+    # as a human-readable cross-reference alongside the consensus JSON.
+    generate_concordance_table
+
+    # ── Step 2: run the tiered consensus engine ─────────────────────────
+    # _hla_consensus.py implements:
+    #   • 2-field voting across all tools (normalised comparison)
+    #   • Tiered confidence: HIGH / MEDIUM / LOW / MANUAL
+    #   • Highest-resolution concordant call selection:
+    #       if HLA-HD + arcasHLA agree at 4-field but OptiType (structurally
+    #       limited to 2-field) also agrees, the 4-field call wins
+    #   • MANUAL locus exclusion + _hla_manual_review.tsv for human sign-off
+    # Exit 2 = loci need human review (not a hard failure).
+    # Exit 1 = critical — no alleles collected at all.
+    log "Running consensus allele calling engine..."
+    local consensus_exit=0
+    cp "$(dirname "${BASH_SOURCE[0]}")/_hla_consensus.py" /tmp/_hla_consensus.py 2>/dev/null || true
+    python3 /tmp/_hla_consensus.py \
+        "$SAMPLE_OUTPUT_DIR" \
+        "$SAMPLE_ID" \
+        "$MHC_MODE" \
+        "$MHC1_TOOL" \
+        "$MHC2_TOOL" \
+        "$SCRIPT_DIR" \
+        "$HLA_INPUT_SOURCE" || consensus_exit=$?
+
+    if [[ $consensus_exit -eq 1 ]]; then
+        error "Consensus engine failed — no alleles collected. Check tool outputs."
+    elif [[ $consensus_exit -eq 2 ]]; then
+        warn "══════════════════════════════════════════════════════"
+        warn " MANUAL REVIEW REQUIRED"
+        warn " One or more HLA loci had complete tool disagreement."
+        warn " Those loci have been EXCLUDED from the pVACtools"
+        warn " allele string. A qualified scientist must review:"
+        warn "   $SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hla_manual_review.tsv"
+        warn " Add the correct alleles manually to the pVACtools"
+        warn " --allele string before running modules 2 and 3."
+        warn "══════════════════════════════════════════════════════"
+        audit_entry "MANUAL_REVIEW_REQUIRED" \
+            "sample=${SAMPLE_ID}" \
+            "tsv=${SAMPLE_OUTPUT_DIR}/${SAMPLE_ID}_hla_manual_review.tsv"
+    fi
+
+    # Audit all outputs
+    local pvac_file="$SCRIPT_DIR/HLA_${SAMPLE_ID}/${SAMPLE_ID}_hla_for_pvactools.txt"
+    local consensus_json="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hla_consensus.json"
+    local manual_tsv="$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hla_manual_review.tsv"
+    [[ -f "$pvac_file"      ]] && audit_file "OUTPUT_PVACTOOLS_STRING"  "$pvac_file"
+    [[ -f "$consensus_json" ]] && audit_file "OUTPUT_HLA_CONSENSUS"     "$consensus_json"
+    [[ -f "$manual_tsv"     ]] && audit_file "OUTPUT_MANUAL_REVIEW_TSV" "$manual_tsv"
+}
+
+
+# ════════════════════════════════════════════════════════════
+#  MAIN
+# ════════════════════════════════════════════════════════════
+
+main() {
+    if [[ $# -gt 0 ]]; then
+        while [[ $# -gt 0 ]]; do
+            case $1 in
+                -1|--r1)          INPUT_R1="$2";       shift 2 ;;
+                -2|--r2)          INPUT_R2="$2";       shift 2 ;;
+                --bam)            INPUT_BAM="$2";      shift 2 ;;
+                --normal-source)  HLA_INPUT_SOURCE="normal"; shift ;;
+                --tumour-source)  HLA_INPUT_SOURCE="tumour"; shift ;;
+                -s|--sample|--sample-id) SAMPLE_ID="$2"; shift 2 ;;
+                -o|--output|--output-dir) OUTPUT_DIR="$2"; shift 2 ;;
+                -p|--threads)     THREADS="$2";        shift 2 ;;
+                --no-interactive) shift ;;
+                --extra-mhc1)     EXTRA_MHC1_TOOL="$2"; shift 2 ;;
+                --rna-tool)       RNA_TOOL="$2";       shift 2 ;;
+                --rna-r1)         RNA_R1="$2";         shift 2 ;;
+                --rna-r2)         RNA_R2="$2";         shift 2 ;;
+                --rna-bam)        RNA_BAM="$2";        shift 2 ;;
+                --mhc-mode)       MHC_MODE="$2";       shift 2 ;;
+                --mhc1-tool)      MHC1_TOOL="$2";      shift 2 ;;
+                --optitype-local) OPTITYPE_LOCAL="$2"; shift 2 ;;
+                --arcasHLA-dir)   ARCASHLA_DIR="$2";  shift 2 ;;
+                --mhc2-tool)      MHC2_TOOL="$2";       shift 2 ;;
+                --hlahd-dir)      HLAHD_DIR="$2";        shift 2 ;;
+                --hlahd-dict-dir) HLAHD_DICT_DIR="$2";   shift 2 ;;
+                --hlahd-freq-dir) HLAHD_FREQ_DIR="$2";   shift 2 ;;
+                # --hla-la-graph deprecated
+                -k|--keep)        KEEP_INTERMEDIATE=true; shift ;;
+                --no-parse)       AUTO_PARSE=false;    shift ;;
+                --imgt-version)   IMGT_HLA_VERSION="$2"; shift 2 ;;
+                --verify-audit)
+                    AUDIT_LOG="${OUTPUT_DIR}/audit_trail.log"
+                    audit_verify; exit $? ;;
+                --qc-min-reads)   QC_MIN_OPTITYPE_READS="$2"; shift 2 ;;
+                --qc-min-depth)   QC_MIN_DEPTH="$2";          shift 2 ;;
+                --qc-min-cov)     QC_MIN_COVERAGE="$2";       shift 2 ;;
+                # ── LOHHLA flags ──────────────────────────────────
+                --tumour-bam)     TUMOUR_BAM="$2";     shift 2 ;;
+                --normal-bam)     NORMAL_BAM="$2";     shift 2 ;;
+                --hla-fasta)      HLA_FASTA="$2";      shift 2 ;;
+                --lohhla-dir)     LOHHLA_DIR="$2";     shift 2 ;;
+                --purity)         PURITY="$2";         shift 2 ;;
+                --ploidy)         PLOIDY="$2";         shift 2 ;;
+                --cram-ref)       CRAM_REF="$2";      shift 2 ;;
+                --purple-segments) PURPLE_SEGMENTS="$2"; shift 2 ;;
+                -h|--help)        usage_noninteractive; exit 0 ;;
+                *) echo "Unknown flag: $1"; exit 1 ;;
+            esac
+        done
+        [[ -z "$SAMPLE_ID" ]] && error "-s/--sample required"
+        [[ -z "$MHC_MODE"  ]] && error "--mhc-mode required"
+
+        # MHC-II tool default — only set if not already specified via --mhc2-tool
+        if [[ "$MHC_MODE" == "mhc2" || "$MHC_MODE" == "both" ]]; then
+            [[ -z "$MHC2_TOOL" ]] && MHC2_TOOL="arcasHLA"
+        fi
+
+        # ── LOHHLA: enable only when both BAMs and HLA FASTA provided ──
+        if [[ -n "$TUMOUR_BAM" && -n "$NORMAL_BAM" && -n "$HLA_FASTA" ]]; then
+            LOHHLA_ENABLED=true
+            info "LOHHLA enabled (tumour/normal pair provided)."
+            # Enforce: HLA typing should always use the normal (germline) BAM.
+            # If the user supplied --bam but not --normal-source, we cannot
+            # distinguish tumour from normal — warn loudly.
+            if [[ -n "$INPUT_BAM" && "$HLA_INPUT_SOURCE" == "unknown" ]]; then
+                warn "═══════════════════════════════════════════════════════"
+                warn " GERMLINE SOURCE WARNING"
+                warn " --bam was provided alongside a tumour/normal pair but"
+                warn " --normal-source was not specified."
+                warn " HLA typing MUST use the germline (normal) BAM."
+                warn " Tumour BAMs may harbour LOH or somatic indels at the"
+                warn " HLA locus that corrupt allele calls."
+                warn " If your --bam IS the normal sample, re-run with:"
+                warn "   --bam <normal.bam> --normal-source"
+                warn " If your --bam IS the tumour, use --normal-bam instead"
+                warn " for HLA typing and --tumour-bam for LOHHLA."
+                warn "═══════════════════════════════════════════════════════"
+                audit_entry "GERMLINE_SOURCE_WARN" "hla_input_source=unknown"
+            elif [[ "$HLA_INPUT_SOURCE" == "tumour" ]]; then
+                warn "═══════════════════════════════════════════════════════"
+                warn " CRITICAL: HLA typing input flagged as TUMOUR."
+                warn " This is not recommended for clinical-grade pipelines."
+                warn " Tumour BAMs may have LOH or somatic indels at HLA"
+                warn " loci that produce incorrect allele calls."
+                warn " Use the matched NORMAL BAM for HLA typing."
+                warn "═══════════════════════════════════════════════════════"
+                audit_entry "GERMLINE_SOURCE_CRITICAL" "hla_input_source=tumour"
+            elif [[ "$HLA_INPUT_SOURCE" == "normal" ]]; then
+                info "HLA typing input confirmed as germline (normal) — correct."
+                audit_entry "GERMLINE_SOURCE_OK" "hla_input_source=normal"
+            fi
+            [[ ! -f "$TUMOUR_BAM" ]] && error "Tumour BAM not found: $TUMOUR_BAM"
+            [[ ! -f "$NORMAL_BAM" ]] && error "Normal BAM not found: $NORMAL_BAM"
+            [[ ! -f "$HLA_FASTA"  ]] && error "HLA FASTA not found: $HLA_FASTA"
+            if [[ -n "$LOHHLA_DIR" && ! -f "$LOHHLA_DIR/LOHHLA.R" ]]; then
+                error "LOHHLA.R not found in --lohhla-dir: $LOHHLA_DIR"
+            fi
+            # Auto-locate LOHHLA.R if dir not given
+            if [[ -z "$LOHHLA_DIR" ]]; then
+                local found_l=""
+                found_l=$(find "${CONDA_PREFIX:-}" "$HOME" /home/aboudreau/PanCancer_EV \
+                    -name "LOHHLA.R" 2>/dev/null | head -n 1 || true)
+                [[ -z "$found_l" ]] && found_l=$(which LOHHLA.R 2>/dev/null || true)
+                [[ -n "$found_l" ]] && LOHHLA_DIR="$(dirname "$found_l")" \
+                    && info "LOHHLA found: $LOHHLA_DIR"
+                [[ -z "$LOHHLA_DIR" ]] && error \
+                    "LOHHLA.R not found — specify --lohhla-dir or install via conda (bioconda)."
+            fi
+        elif [[ -n "$TUMOUR_BAM" || -n "$NORMAL_BAM" ]]; then
+            warn "LOHHLA requires BOTH --tumour-bam and --normal-bam (plus --hla-fasta). Skipping LOH-HLA."
+            LOHHLA_ENABLED=false
+        else
+            LOHHLA_ENABLED=false
+        fi
+
+        OUTPUT_DIR="$SCRIPT_DIR/HLA_${SAMPLE_ID}/hla_typing_output"
+        mkdir -p "$OUTPUT_DIR"
+        CONVERSION_LOG="$OUTPUT_DIR/conversions.log"
+        AUDIT_LOG="$OUTPUT_DIR/audit_trail.log"
+        echo "# HLA Pipeline Conversion Log — $(date)" > "$CONVERSION_LOG"
+        printf '# HLA Typing Pipeline Audit Trail\n# Started: %s\n# User: %s  Host: %s\n' \
+            "$(date -u +'%Y-%m-%dT%H:%M:%SZ')" "${USER:-unknown}" "$(hostname)" > "$AUDIT_LOG"
+        audit_entry "PIPELINE_START" "version=3.5" "sample=$SAMPLE_ID" \
+            "mode=$MHC_MODE" "threads=$THREADS" "user=${USER:-unknown}" "host=$(hostname)"
+        for _t in samtools bwa bowtie2 python3 seqtk; do audit_tool "$_t"; done
+        [[ -n "$INPUT_R1"  ]] && { audit_file "INPUT_R1"  "$INPUT_R1";  ensure_fastq "$INPUT_R1" "scripted"; }
+        [[ -n "$INPUT_BAM" ]] && { audit_file "INPUT_BAM" "$INPUT_BAM"; ensure_bam   "$INPUT_BAM" "scripted"; }
+    else
+        interactive_setup
+    fi
+
+    SAMPLE_OUTPUT_DIR="$SCRIPT_DIR/HLA_${SAMPLE_ID}/hla_typing_output"
+    mkdir -p "$SAMPLE_OUTPUT_DIR"
+
+    checkpoint_init
+
+    log "Pipeline starting — sample: $SAMPLE_ID"
+
+    if [[ "$MHC_MODE" == "mhc1" || "$MHC_MODE" == "both" ]]; then
+        case "$MHC1_TOOL" in
+            optitype)
+                if checkpoint_skip "stage_optitype"; then
+                    log "Skipping OptiType — already completed (checkpoint)."
+                else
+                    audit_entry "STAGE_START" "stage=optitype"
+                    # Save FASTQ paths before OptiType (may modify INPUT_R1/R2)
+                    SAVED_R1="$INPUT_R1"; SAVED_R2="${INPUT_R2:-}"
+                    retry 3 30 run_optitype || error "OptiType failed after 3 attempts."
+                    # Restore FASTQ paths for arcasHLA
+                    INPUT_R1="$SAVED_R1"; INPUT_R2="$SAVED_R2"
+                    audit_file "OUTPUT_OPTITYPE_TSV" \
+                        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_optitype_result.tsv"
+                    checkpoint_done "stage_optitype"
+                fi ;;
+            arcasHLA)
+                if checkpoint_skip "stage_hla_la_mhc1"; then
+                    log "Skipping arcasHLA (MHC-I) — already completed (checkpoint)."
+                else
+                    audit_entry "STAGE_START" "stage=hla_la_mhc1"
+                    retry 3 60 run_arcasHLA || error "arcasHLA failed after 3 attempts."
+                    audit_file "OUTPUT_ARCASHLA_RESULT" \
+                        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_result.json"
+                    checkpoint_done "stage_hla_la_mhc1"
+                fi ;;
+            hlahd)
+                if checkpoint_skip "stage_hlahd"; then
+                    log "Skipping HLA-HD (MHC-I) — already completed (checkpoint)."
+                else
+                    audit_entry "STAGE_START" "stage=hlahd"
+                    SAVED_R1="$INPUT_R1"; SAVED_R2="${INPUT_R2:-}"
+                    retry 3 60 run_hlahd || error "HLA-HD failed after 3 attempts."
+                    INPUT_R1="$SAVED_R1"; INPUT_R2="$SAVED_R2"
+                    audit_file "OUTPUT_HLAHD_RESULT" \
+                        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_final.result.txt"
+                    checkpoint_done "stage_hlahd"
+                fi ;;
+            *) error "Unknown MHC-I tool: $MHC1_TOOL" ;;
+        esac
+    fi
+
+    if [[ "$MHC_MODE" == "mhc2" || "$MHC_MODE" == "both" ]]; then
+        case "$MHC2_TOOL" in
+            arcasHLA)
+                if checkpoint_skip "stage_hla_la_mhc2"; then
+                    log "Skipping arcasHLA (MHC-II) — already completed (checkpoint)."
+                else
+                    audit_entry "STAGE_START" "stage=hla_la_mhc2"
+                    # Restore FASTQ paths in case OptiType modified them
+                    [[ -n "${SAVED_R1:-}" ]] && INPUT_R1="$SAVED_R1"
+                    [[ -n "${SAVED_R2:-}" ]] && INPUT_R2="$SAVED_R2"
+                    retry 3 60 run_arcasHLA || error "arcasHLA (MHC-II) failed after 3 attempts."
+                    audit_file "OUTPUT_ARCASHLA_RESULT" \
+                        "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_arcasHLA_result.json"
+                    checkpoint_done "stage_hla_la_mhc2"
+                fi ;;
+            hlahd)
+                if checkpoint_skip "stage_hlahd"; then
+                    log "Skipping HLA-HD (MHC-II) — already completed (checkpoint, ran with MHC-I)."
+                else
+                    audit_entry "STAGE_START" "stage=hlahd_mhc2"
+                    # If MHC1 was not hlahd, run it now; if it was, result already exists
+                    if [[ "$MHC1_TOOL" != "hlahd" ]]; then
+                        [[ -n "${SAVED_R1:-}" ]] && INPUT_R1="$SAVED_R1"
+                        [[ -n "${SAVED_R2:-}" ]] && INPUT_R2="$SAVED_R2"
+                        retry 3 60 run_hlahd || error "HLA-HD (MHC-II) failed after 3 attempts."
+                        audit_file "OUTPUT_HLAHD_RESULT" \
+                            "$SAMPLE_OUTPUT_DIR/${SAMPLE_ID}_hlahd_final.result.txt"
+                    else
+                        log "HLA-HD MHC-II alleles already extracted during MHC-I stage."
+                    fi
+                    checkpoint_done "stage_hlahd"
+                fi ;;
+            *) error "Unknown MHC-II tool: $MHC2_TOOL" ;;
+        esac
+    fi
+
+    # ── IMGT/HLA normalisation — pin all tool outputs to one release ──
+    # Must run after all typing tools and before QC / consensus / pVACtools
+    # so that every downstream step sees canonically normalised allele strings.
+    if checkpoint_skip "stage_imgt_norm"; then
+        log "Skipping IMGT normalisation — already completed (checkpoint)."
+    else
+        audit_entry "STAGE_START" "stage=imgt_norm"
+        # Copy the normaliser helper to a predictable tmp path for the bash caller
+        cp "$(dirname "${BASH_SOURCE[0]}")/_hla_imgt_norm.py" /tmp/_hla_imgt_norm.py 2>/dev/null || true
+        normalise_alleles_imgt
+        checkpoint_done "stage_imgt_norm"
+    fi
+
+    # ── QC ────────────────────────────────────────────────────
+    if checkpoint_skip "stage_qc"; then
+        log "Skipping QC — already completed (checkpoint)."
+    else
+        audit_entry "STAGE_START" "stage=qc"
+        run_qc
+        checkpoint_done "stage_qc"
+    fi
+
+    # ── pVACtools formatting ───────────────────────────────────
+    if [[ "$AUTO_PARSE" == true ]]; then
+        if checkpoint_skip "stage_pvactools"; then
+            log "Skipping pVACtools format — already completed (checkpoint)."
+        else
+            audit_entry "STAGE_START" "stage=pvactools"
+            # Copy Python helpers to /tmp so parse_for_pvactools can find them
+            for _helper in _hla_consensus.py _hla_concordance.py _hla_imgt_norm.py; do
+                local _src; _src="$(dirname "${BASH_SOURCE[0]}")/$_helper"
+                [[ -f "$_src" ]] && cp "$_src" "/tmp/$_helper" 2>/dev/null || true
+            done
+            parse_for_pvactools
+            # Output auditing is now inside parse_for_pvactools itself
+            checkpoint_done "stage_pvactools"
+        fi
+    fi
+
+    # ── LOHHLA — LOH-HLA detection (only if enabled) ──────────
+    if [[ "$LOHHLA_ENABLED" == true ]]; then
+        if checkpoint_skip "stage_lohhla"; then
+            log "Skipping LOHHLA — already completed (checkpoint)."
+        else
+            audit_entry "STAGE_START" "stage=lohhla"
+            retry 2 60 run_lohhla || warn "LOHHLA failed — pipeline continues without LOH data."
+            [[ -f "$SAMPLE_OUTPUT_DIR/HLA_LOH_STATUS.json" ]] && \
+                audit_file "OUTPUT_LOHHLA_JSON" "$SAMPLE_OUTPUT_DIR/HLA_LOH_STATUS.json"
+            checkpoint_done "stage_lohhla"
+        fi
+    fi
+
+    [[ "$KEEP_INTERMEDIATE" == false ]] && rm -rf "$SAMPLE_OUTPUT_DIR/arcasHLA_working"
+    [[ "$KEEP_INTERMEDIATE" == false ]] && rm -rf "$SAMPLE_OUTPUT_DIR/hlahd_working"
+
+    audit_entry "PIPELINE_COMPLETE" "sample=$SAMPLE_ID"
+    [[ -f "$CHECKPOINT_FILE" ]] && rm -f "$CHECKPOINT_FILE" \
+        && audit_entry "CHECKPOINT_CLEARED" "reason=clean_finish"
+
+    echo ""
+    echo -e "${BOLD}${CYAN}══════════════════════════════════════════════════${RESET}"
+    echo -e "${BOLD}  OUTPUT FILES${RESET}"
+    echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
+    echo -e "  ${BOLD}Key file (pVACtools input):${RESET}"
+    local pvac_key="$SCRIPT_DIR/HLA_${SAMPLE_ID}/${SAMPLE_ID}_hla_for_pvactools.txt"
+    if [[ -f "$pvac_key" ]]; then
+        echo -e "  ${GREEN}✓${RESET}  ${BOLD}${SAMPLE_ID}_hla_for_pvactools.txt${RESET}  ${CYAN}← $(dirname "$pvac_key")${RESET}"
+    else
+        echo -e "  ${YELLOW}⚠${RESET}  ${SAMPLE_ID}_hla_for_pvactools.txt  ${YELLOW}(not found)${RESET}"
+    fi
+    echo ""
+    echo -e "  ${BOLD}Accessory files (HLA_${SAMPLE_ID}/hla_typing_output/):${RESET}"
+    for f in \
+        "${SAMPLE_ID}_optitype_result.tsv" \
+        "${SAMPLE_ID}_optitype_alleles.txt" \
+        "${SAMPLE_ID}_optitype_coverage.pdf" \
+        "${SAMPLE_ID}_arcasHLA_result.json"    \
+        "${SAMPLE_ID}_arcasHLA_alleles.txt"   \
+        "${SAMPLE_ID}_hlahd_mhc2_alleles.txt" \
+        "${SAMPLE_ID}_hlahd_nc_alleles.txt"   \
+        "${SAMPLE_ID}_imgt_normalisation.json" \
+        "${SAMPLE_ID}_qc_report.txt"
+    do
+        [[ -f "$SAMPLE_OUTPUT_DIR/$f" ]] && echo -e "  ${GREEN}✓${RESET}  $f"
+    done
+    # Non-classical HLA immune-escape flag
+    if [[ -f "$SAMPLE_OUTPUT_DIR/HLA_NC_STATUS.json" ]]; then
+        echo -e "  ${GREEN}✓${RESET}  ${BOLD}HLA_NC_STATUS.json${RESET}  ${CYAN}← HLA-E/F/G immune-escape flags${RESET}"
+    fi
+    if [[ "$LOHHLA_ENABLED" == true ]]; then
+        if [[ -f "$SAMPLE_OUTPUT_DIR/HLA_LOH_STATUS.json" ]]; then
+            echo -e "  ${GREEN}✓${RESET}  ${BOLD}HLA_LOH_STATUS.json${RESET}  ${CYAN}← LOH-HLA results${RESET}"
+        else
+            echo -e "  ${YELLOW}⚠${RESET}  HLA_LOH_STATUS.json  ${YELLOW}(LOHHLA may have failed — check lohhla/)${RESET}"
+        fi
+    else
+        echo -e "  ${YELLOW}–${RESET}  HLA_LOH_STATUS.json  ${YELLOW}(skipped — no tumour/normal pair provided)${RESET}"
+    fi
+    [[ -s "$CONVERSION_LOG" ]] && echo -e "  ${YELLOW}⚙${RESET}  conversions.log"
+    [[ -s "$AUDIT_LOG"      ]] && echo -e "  ${CYAN}🔒${RESET}  audit_trail.log"
+    echo -e "${CYAN}══════════════════════════════════════════════════${RESET}"
+    log "Done. All results: $SCRIPT_DIR/HLA_${SAMPLE_ID}/"
+}
+
+usage_noninteractive() {
+    cat <<EOF
+HLA Typing Pipeline v3.5 — scripted / non-interactive mode
+
+Usage: $0 -s SAMPLE_ID --mhc-mode MODE [options]
+
+  -s, --sample ID        Sample ID (required)
+  --mhc-mode MODE        mhc1 | mhc2 | both
+  --mhc1-tool TOOL       optitype | arcasHLA | hlahd  (MHC-I tool)
+  --mhc2-tool TOOL       arcasHLA | hlahd  (MHC-II tool; default: arcasHLA)
+  -1, --r1 FILE          Read 1 — ANY format, auto-converted
+  -2, --r2 FILE          Read 2 (optional)
+  --bam FILE             BAM/CRAM — ANY format, auto-converted
+  --normal-source        Assert that --bam is a germline/normal sample (recommended)
+  --tumour-source        Assert that --bam is a tumour sample (triggers warning)
+  -o, --output DIR       Output directory [./hla_typing_output]
+  -p, --threads N        Threads [4]
+  --optitype-local PATH  Local OptiType dir
+  --arcasHLA-dir PATH    arcasHLA dir [auto-configured]
+  --hlahd-dir PATH       HLA-HD install dir [auto-configured]
+  --hlahd-dict-dir PATH  HLA-HD bowtie2 dictionary dir [auto-configured]
+  --hlahd-freq-dir PATH  HLA-HD frequency data dir [auto-configured]
+  # --hla-la-graph deprecated (arcasHLA uses IMGT/HLA reference)
+  -k, --keep             Keep intermediate files
+  --no-parse             Skip pVACtools formatting
+  --imgt-version N       IMGT/HLA release to normalise against [3510 = 3.51.0]
+  --verify-audit         Verify audit trail chain integrity and exit
+
+LOH-HLA detection (LOHHLA) — requires all three flags below:
+  --tumour-bam FILE      Tumour BAM/CRAM (enables LOHHLA when paired with --normal-bam)
+  --normal-bam FILE      Matched normal BAM/CRAM
+  --hla-fasta  FILE      Polysolver-style HLA reference FASTA
+  --lohhla-dir PATH      LOHHLA install dir (containing LOHHLA.R) [auto-detected]
+  --purity     FLOAT     Tumour purity estimate [0–1, optional]
+  --ploidy     FLOAT     Tumour ploidy estimate [optional]
+  --cram-ref FILE        Reference FASTA for CRAM decoding (required if any input is .cram)
+  --purple-segments FILE PURPLE copy-number segments for copy-number-corrected LOH
+                         Enables --CopyNumLoc TRUE in LOHHLA (highly recommended)
+                         Usually: <sample>.purple.cnv.somatic.tsv
+  Output: HLA_LOH_STATUS.json  (omitted automatically when BAM pair is absent)
+
+QC thresholds (override defaults):
+  --qc-min-reads N       Min OptiType mapped HLA reads [10]
+  --qc-min-depth N       Min mean read depth at MHC region [5]
+  --qc-min-cov N         Min recommended coverage threshold [10]
+
+  -h, --help             Show this message
+EOF
+}
+
+main "$@"
