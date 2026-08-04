@@ -8,11 +8,6 @@ Usage:
                               <mhc1_tool> <mhc2_tool> <script_dir>
                               <hla_input_source>
 
-What this replaces
-------------------
-The old formatter simply concatenated whatever alleles each tool produced.
-This engine implements a tiered consensus approach:
-
   1. Collect per-tool allele calls for every locus.
   2. Reduce all calls to 2-field for voting (normalised comparison).
   3. Tier assignment:
