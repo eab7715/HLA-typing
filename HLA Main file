@@ -707,8 +707,6 @@ setup_imgt_normalisation() {
     # Check whether py-ard is available right now.
     # The package installs as "pyard" (import pyard) in newer releases
     # and as "ard" (import ard) in older ones — try both.
-    # Also verify it is importable in the exact python3 on PATH,
-    # since conda/venv environments can shadow the system python.
     local _pyard_ok=false _pyard_ver="unknown" _pyard_module=""
     local _py; _py=$(command -v python3 2>/dev/null || echo "python3")
     if "$_py" -c "import pyard; print(pyard.__version__)" 2>/dev/null; then
@@ -975,9 +973,6 @@ _collect_hlahd_install() {
 run_optitype() {
     log "Running OptiType (MHC-I)..."
 
-    # NOTE: 'conda activate' does not work in non-interactive bash scripts.
-    # Use 'conda run -n <env>' instead — it spawns a subprocess in the correct env.
-
     local out="$SAMPLE_OUTPUT_DIR/optitype"; mkdir -p "$out"
 
     if [[ -n "$OPTITYPE_LOCAL" ]]; then
@@ -989,8 +984,6 @@ run_optitype() {
         local input_args="-i $abs_r1"
         [[ -n "$abs_r2" ]] && input_args="$input_args -i $abs_r2"
 
-        # Use the optitype binary directly from the conda env — avoids the
-        # 'No module named optitype' error that occurs when calling via python.
         local optitype_bin="/home/aboudreau/.conda/envs/optitype_env/bin/optitype"
         local cfg_arg2=""
         [[ -n "${CONFIG_FILE:-}" ]] && cfg_arg2="--config $CONFIG_FILE"
@@ -1635,20 +1628,6 @@ setup_lohhla() {
     INPUT_BAM="$saved_bam"   # restore so downstream stages still see the original BAM
     echo -e "  ${GREEN}✓ Normal BAM: $NORMAL_BAM${RESET}"
 
-    # ── Germline source confirmation ──────────────────────
-    # IMPORTANT: by this point INPUT_BAM has been overwritten by
-    # the tumour/normal collection above. We must NOT use $INPUT_BAM
-    # to label the HLA typing input — it no longer points to the
-    # original HLA typing BAM/FASTQ.
-    #
-    # Instead, derive the label from INPUT_R1 (FASTQ path set earlier
-    # in the wizard by _collect_and_ensure_fastq) or, if the user
-    # provided a BAM for typing, from HLA_TYPING_INPUT_BAM which we
-    # capture below before this function is ever called.
-    #
-    # We also know the normal BAM they just provided ($NORMAL_BAM), so
-    # we can intelligently suggest "Normal" as the default and only ask
-    # if the HLA typing input does NOT match the normal BAM.
     echo ""
     echo -e "  ${BOLD}Germline Source Confirmation${RESET}"
     echo -e "  ${CYAN}For clinical-grade HLA typing, alleles MUST be called from the${RESET}"
@@ -1670,8 +1649,6 @@ setup_lohhla() {
     echo -e "  ${BOLD}Normal BAM you just provided: $(basename "$NORMAL_BAM")${RESET}"
     echo ""
 
-    # Smart default: if the HLA typing input matches the normal BAM
-    # (same basename), auto-confirm as normal without asking.
     local normal_bn; normal_bn="$(basename "$NORMAL_BAM")"
     if [[ "$hla_typing_label" == *"$normal_bn"* ]]; then
         HLA_INPUT_SOURCE="normal"
