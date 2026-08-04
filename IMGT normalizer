@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""
+_hla_imgt_norm.py  —  IMGT/HLA allele normalisation via py-ard
+Called by normalise_alleles_imgt() in the HLA typing pipeline.
+
+Usage:
+    python3 _hla_imgt_norm.py <imgt_version> <out_dir> <sample_id> <file1> [file2 ...]
+
+Strategy per allele:
+  1. Strip the HLA- prefix before lookup (py-ard expects it, adds it back).
+  2. Attempt "allele" (4-field) resolution first.
+  3. Fall back to "lgx" (2-field G-group) resolution — handles OptiType
+     calls that only report to 2-field precision.
+  4. If py-ard cannot resolve, keep the original and flag as "unresolved".
+  5. Always write output with HLA- prefix for downstream consistency.
+  6. Back up original files with .prenorm suffix before overwriting.
+"""
+import sys, os, json, shutil
+from datetime import datetime, timezone
+
+def main():
+    if len(sys.argv) < 4:
+        print("Usage: _hla_imgt_norm.py <imgt_version> <out_dir> <sample_id> [pyard_module] [files...]")
+        sys.exit(1)
+
+    imgt_ver   = sys.argv[1]
+    out_dir    = sys.argv[2]
+    sample_id  = sys.argv[3]
+    # Optional: caller may pass the detected module name as argv[4]
+    # so we try it first before falling back to both names ourselves.
+    if len(sys.argv) > 4 and sys.argv[4] in ("pyard", "ard"):
+        preferred_module = sys.argv[4]
+        allele_files = sys.argv[5:]
+    else:
+        preferred_module = None
+        allele_files = sys.argv[4:]
+
+    # ── Initialise py-ard ────────────────────────────────────
+    # The package installs as "pyard" in newer releases, "ard" in older ones.
+    # Try the preferred module first (passed from caller), then both.
+    a      = None
+    ard_ok = False
+    _mod_order = ([preferred_module] + [m for m in ("pyard", "ard")
+                  if m != preferred_module])
+    for _modname in _mod_order:
+        try:
+            mod = __import__(_modname)
+            # pyard >= 1.0 uses pyard.init(); older ard uses ard.ARD()
+            if hasattr(mod, 'init'):
+                a = mod.init(imgt_ver)
+            else:
+                a = mod.ARD(imgt_ver)
+            ard_ok = True
+            print(f"  [INFO] py-ard initialised via '{_modname}' — IMGT/HLA {imgt_ver}")
+            break
+        except Exception as e:
+            print(f"  [WARN] '{_modname}' failed: {e}")
+    if not ard_ok:
+        print(f"  [WARN] py-ard not available — allele files will be left unchanged.")
+        print(f"  [WARN] Install with: pip install py-ard")
+        print(f"  [WARN] Verify with:  python3 -c \"import pyard; print(pyard.__version__)\"")
+
+    norm_report = {
+        "sample_id":     sample_id,
+        "imgt_version":  imgt_ver,
+        "ard_available": ard_ok,
+        "generated_utc": datetime.now(timezone.utc).isoformat(),
+        "files":         {}
+    }
+
+    for fpath in allele_files:
+        fname = os.path.basename(fpath)
+        # Derive a short tool label from the filename
+        tool = (fname
+                .replace(f"{sample_id}_", "")
+                .replace("_alleles.txt", "")
+                .replace("_mhc2", "")
+                .replace("_nc", ""))
+
+        with open(fpath) as fh:
+            lines = fh.readlines()
+
+        out_lines   = []
+        file_report = []
+
+        for line in lines:
+            stripped = line.rstrip("\n\r")
+            # Pass through comment and blank lines untouched
+            if not stripped or stripped.startswith("#"):
+                out_lines.append(line)
+                continue
+
+            normalised, method = _normalise(stripped, a if ard_ok else None)
+            out_lines.append(normalised + "\n")
+
+            if normalised != stripped or method in ("unresolved", "no_ard"):
+                file_report.append({
+                    "original":   stripped,
+                    "normalised": normalised,
+                    "method":     method
+                })
+
+        # Back up original before overwriting (only once per run)
+        backup = fpath + ".prenorm"
+        if not os.path.exists(backup):
+            shutil.copy2(fpath, backup)
+
+        with open(fpath, "w") as fh:
+            fh.writelines(out_lines)
+
+        changes = sum(1 for r in file_report if r["normalised"] != r["original"])
+        unres   = sum(1 for r in file_report if r["method"] == "unresolved")
+        status  = "✓" if changes == 0 else f"↻ {changes} updated"
+        if unres:
+            status += f"  ⚠ {unres} unresolved"
+        print(f"  {status:30s}  {fname}")
+
+        norm_report["files"][fname] = {
+            "tool":       tool,
+            "changes":    changes,
+            "unresolved": unres,
+            "detail":     file_report
+        }
+
+    # ── Write normalisation report ───────────────────────────
+    report_path = os.path.join(out_dir, f"{sample_id}_imgt_normalisation.json")
+    with open(report_path, "w") as fh:
+        json.dump(norm_report, fh, indent=2)
+
+    total_changes = sum(v["changes"]    for v in norm_report["files"].values())
+    total_unres   = sum(v["unresolved"] for v in norm_report["files"].values())
+
+    print(f"\n  IMGT/HLA normalisation complete.")
+    print(f"  Alleles updated  : {total_changes}")
+    if total_unres:
+        print(f"  Unresolved       : {total_unres}  (kept as-is — manual review recommended)")
+    print(f"  Report           : {report_path}")
+    print(f"  Originals backed up with .prenorm suffix.\n")
+
+
+def _normalise(raw_allele, ard_obj):
+    """
+    Resolve one allele string to its canonical form under the pinned
+    IMGT release.
+
+    Returns (normalised_string, method_label).
+
+    py-ard "allele" reduction gives the most specific unambiguous
+    designation at the available resolution.  "lgx" gives 2-field
+    G-group resolution, which is what pVACtools ultimately needs and
+    is the safe fallback for tools that only report 2-field calls.
+    """
+    if ard_obj is None:
+        return raw_allele, "no_ard"
+
+    # Normalise prefix: accept "HLA-A*02:01" and "A*02:01"
+    allele = raw_allele.strip()
+    bare   = allele[4:] if allele.upper().startswith("HLA-") else allele
+    # py-ard wants the HLA- prefix
+    lookup = f"HLA-{bare}"
+
+    for redux in ("allele", "lgx"):
+        try:
+            resolved = ard_obj.redux(lookup, redux)
+            if resolved:
+                # Guarantee HLA- prefix on output
+                if not resolved.startswith("HLA-"):
+                    resolved = f"HLA-{resolved}"
+                return resolved, redux
+        except Exception:
+            continue
+
+    # Could not resolve — return original unchanged
+    return raw_allele, "unresolved"
+
+
+if __name__ == "__main__":
+    main()
