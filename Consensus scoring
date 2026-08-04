@@ -1,0 +1,518 @@
+#!/usr/bin/env python3
+"""
+_hla_consensus.py  —  Consensus HLA allele calling engine + pVACtools formatter
+Called by parse_for_pvactools() in the HLA typing pipeline.
+
+Usage:
+    python3 _hla_consensus.py <out_dir> <sample_id> <mhc_mode>
+                              <mhc1_tool> <mhc2_tool> <script_dir>
+                              <hla_input_source>
+
+What this replaces
+------------------
+The old formatter simply concatenated whatever alleles each tool produced.
+This engine implements a tiered consensus approach:
+
+  1. Collect per-tool allele calls for every locus.
+  2. Reduce all calls to 2-field for voting (normalised comparison).
+  3. Tier assignment:
+       HIGH    — all applicable tools agree at 2-field  (3/3 or 2/2)
+       MEDIUM  — majority agree (2/3)
+       LOW     — only one tool produced a call (singleton)
+       MANUAL  — tools all disagree (flag for human review)
+  4. Resolution selection:
+       Use the highest-resolution concordant call for the pVACtools string.
+       If HLA-HD and arcasHLA agree at 4-field but OptiType only provides
+       2-field, the 4-field call from the agreeing pair is used.
+       OptiType is structurally limited to 2-field; this is expected and
+       handled gracefully — it contributes to the vote without penalising
+       the resolution of the final call.
+  5. Manual-review flagging:
+       MANUAL-tier loci are written to a separate
+       <sample_id>_hla_manual_review.tsv and excluded from the pVACtools
+       string with a WARN. In a clinical trial, a human resolves these.
+  6. pVACtools string:
+       HIGH and MEDIUM confidence alleles are included.
+       LOW confidence alleles are included but annotated.
+       MANUAL loci are excluded and flagged.
+
+Tool failure-mode awareness
+---------------------------
+OptiType   : 2-field only; very accurate for MHC-I from WES/WGS.
+             Never penalise for 2-field — it's a design constraint, not error.
+arcasHLA   : Up to 4-field; can fail on lowly expressed genes in RNA-seq.
+             A missing call at a locus is treated as "not typed", not "wrong".
+HLA-HD     : Up to 4-field (8-digit); most accurate overall but can fail at
+             low coverage. An empty result file = tool failure, treated
+             separately from "typed and called a different allele".
+
+Outputs
+-------
+  <sample_id>_hla_for_pvactools.txt   — comma-separated pVACtools allele string
+  <sample_id>_hla_consensus.json      — full consensus report (machine-readable)
+  <sample_id>_hla_manual_review.tsv   — loci requiring human adjudication
+"""
+
+import sys, os, json
+from collections import defaultdict
+from datetime import datetime, timezone
+
+
+# ── Tool metadata ────────────────────────────────────────────────────────────
+# max_resolution: maximum number of fields a tool can report
+# covers:         which locus classes the tool handles
+TOOL_META = {
+    "optitype": {
+        "max_resolution": 2,
+        "covers":         ["mhc1"],
+        "note":           "Structurally limited to 2-field. Contributes to vote only."
+    },
+    "arcasHLA": {
+        "max_resolution": 4,
+        "covers":         ["mhc1", "mhc2"],
+        "note":           "RNA-seq based. May fail on lowly expressed genes."
+    },
+    "hlahd": {
+        "max_resolution": 4,
+        "covers":         ["mhc1", "mhc2", "mhc_nc"],
+        "note":           "Most accurate overall. May fail at low coverage."
+    },
+}
+
+MHC1_GENES  = {"A", "B", "C"}
+MHC2_GENES  = {"DRB1", "DRB3", "DRB4", "DRB5", "DQA1", "DQB1", "DPA1", "DPB1"}
+MHC_NC_GENES = {"E", "F", "G"}
+
+
+def main():
+    if len(sys.argv) < 8:
+        print("Usage: _hla_consensus.py out_dir sample_id mhc_mode "
+              "mhc1_tool mhc2_tool script_dir hla_input_source")
+        sys.exit(1)
+
+    (out_dir, sample_id, mhc_mode,
+     mhc1_tool, mhc2_tool, script_dir, hla_input_source) = sys.argv[1:8]
+
+    # ── Load per-tool allele files ────────────────────────────────────────────
+    tool_alleles = _load_tool_alleles(
+        out_dir, sample_id, mhc_mode, mhc1_tool, mhc2_tool)
+
+    active_tools = [t for t, a in tool_alleles.items() if a is not None]
+    failed_tools = [t for t, a in tool_alleles.items() if a is None]
+
+    print(f"\n  Tools with results : {', '.join(active_tools) or 'NONE'}")
+    if failed_tools:
+        print(f"  Tools with no output (failed/not run): {', '.join(failed_tools)}")
+
+    # ── Build per-locus per-tool call map ─────────────────────────────────────
+    # locus_calls[gene][tool] = list of allele strings (may be empty if not typed)
+    locus_calls = _build_locus_map(tool_alleles, mhc_mode, mhc1_tool, mhc2_tool)
+
+    # ── Run consensus engine ──────────────────────────────────────────────────
+    consensus_results = {}     # gene -> consensus record
+    manual_review    = []      # list of genes requiring human adjudication
+    pvac_alleles     = []      # final alleles for pVACtools string
+    nc_alleles       = []      # non-classical — not in pVACtools string
+
+    for gene, tool_map in sorted(locus_calls.items()):
+        gene_label = f"HLA-{gene}" if not gene.startswith("HLA-") else gene
+        bare_gene  = gene_label[4:]  # strip HLA-
+
+        record = _consensus_for_gene(gene_label, tool_map, active_tools)
+        consensus_results[gene_label] = record
+
+        is_nc = bare_gene in MHC_NC_GENES
+
+        if is_nc:
+            # Non-classical: record for immune-escape annotation, never pVACtools
+            nc_alleles.append(record)
+        elif record["tier"] == "MANUAL":
+            manual_review.append(record)
+            print(f"  ⚠  {gene_label}: MANUAL REVIEW — tools disagree "
+                  f"({_format_calls(tool_map)})")
+        else:
+            # Add to pVACtools list; include HIGH, MEDIUM, LOW
+            for allele in record["pvac_alleles"]:
+                pvac_alleles.append(allele)
+            tier_sym = {"HIGH": "✓", "MEDIUM": "~", "LOW": "⚠"}.get(record["tier"], "?")
+            print(f"  {tier_sym}  {gene_label}: {record['tier']} — "
+                  f"{', '.join(record['pvac_alleles'])}")
+
+    # ── Write pVACtools string ────────────────────────────────────────────────
+    pvac_str = ",".join(pvac_alleles)
+    hla_dir  = os.path.join(script_dir, f"HLA_{sample_id}")
+    os.makedirs(hla_dir, exist_ok=True)
+    pvac_file = os.path.join(hla_dir, f"{sample_id}_hla_for_pvactools.txt")
+
+    with open(pvac_file, "w") as fh:
+        fh.write(pvac_str + "\n")
+
+    # ── Write manual review TSV ───────────────────────────────────────────────
+    manual_tsv = os.path.join(out_dir, f"{sample_id}_hla_manual_review.tsv")
+    _write_manual_review_tsv(manual_tsv, manual_review, sample_id, hla_input_source)
+
+    # ── Write consensus JSON ──────────────────────────────────────────────────
+    consensus_json = os.path.join(out_dir, f"{sample_id}_hla_consensus.json")
+    _write_consensus_json(
+        consensus_json, sample_id, consensus_results,
+        active_tools, failed_tools, hla_input_source,
+        pvac_str, manual_review)
+
+    # ── Console summary ───────────────────────────────────────────────────────
+    _print_summary(
+        sample_id, pvac_alleles, pvac_str, pvac_file,
+        manual_review, nc_alleles, active_tools, hla_input_source)
+
+    # Non-zero exit if there are MANUAL loci — lets the bash caller decide
+    # whether to abort or continue with a warning
+    if manual_review:
+        sys.exit(2)   # exit code 2 = "needs human review", not a hard failure
+
+
+# ── Allele loading ────────────────────────────────────────────────────────────
+
+def _load_tool_alleles(out_dir, sample_id, mhc_mode, mhc1_tool, mhc2_tool):
+    """
+    Returns dict: tool_name -> list of allele strings, or None if file absent.
+    None signals tool failure / not run (different from an empty list).
+    """
+    tool_alleles = {}
+
+    def _read(path):
+        if not os.path.isfile(path):
+            return None   # file absent = tool did not produce output
+        lines = []
+        with open(path) as fh:
+            for line in fh:
+                s = line.strip()
+                if s and not s.startswith("#"):
+                    lines.append(s)
+        return lines   # empty list is valid (tool ran, typed nothing)
+
+    # Always load every tool whose allele file exists — this allows the
+    # consensus engine to incorporate all available tools regardless of which
+    # tool was specified as mhc1/mhc2 in the calling pipeline pass.
+    import os as _os
+
+    optitype_f = f"{out_dir}/{sample_id}_optitype_alleles.txt"
+    if _os.path.exists(optitype_f):
+        tool_alleles["optitype"] = _read(optitype_f)
+
+    arcashla_f = f"{out_dir}/{sample_id}_arcasHLA_alleles.txt"
+    if _os.path.exists(arcashla_f):
+        tool_alleles["arcasHLA"] = _read(arcashla_f)
+
+    if mhc1_tool == "hlahd" or _os.path.exists(f"{out_dir}/{sample_id}_hlahd_alleles.txt"):
+        mhc1 = _read(f"{out_dir}/{sample_id}_hlahd_alleles.txt") or []
+        mhc2 = _read(f"{out_dir}/{sample_id}_hlahd_mhc2_alleles.txt") or []
+        nc   = _read(f"{out_dir}/{sample_id}_hlahd_nc_alleles.txt") or []
+        combined = mhc1 + mhc2 + nc
+        tool_alleles["hlahd"] = combined if (mhc1 or mhc2 or nc) else None
+
+    if mhc_mode in ("mhc2", "both") and mhc2_tool == "arcasHLA":
+        tool_alleles.setdefault("arcasHLA", _read(
+            f"{out_dir}/{sample_id}_arcasHLA_alleles.txt"))
+
+    return tool_alleles
+
+
+def _build_locus_map(tool_alleles, mhc_mode, mhc1_tool, mhc2_tool):
+    """
+    Returns dict: bare_gene -> {tool -> [allele_string, ...]}
+    Only includes loci relevant to the current mhc_mode.
+    """
+    locus_calls = defaultdict(lambda: defaultdict(list))
+
+    for tool, alleles in tool_alleles.items():
+        if alleles is None:
+            continue
+        for allele in alleles:
+            gene = _extract_bare_gene(allele)
+            if gene is None:
+                continue
+            # Filter to relevant loci
+            if gene in MHC1_GENES and mhc_mode not in ("mhc1", "both"):
+                continue
+            if gene in MHC2_GENES and mhc_mode not in ("mhc2", "both"):
+                continue
+            # OptiType only calls MHC-I
+            if tool == "optitype" and gene not in MHC1_GENES:
+                continue
+            # arcasHLA does not reliably type DRB3/4/5 — skip those loci for it
+            if tool == "arcasHLA" and gene in {"DRB3", "DRB4", "DRB5"}:
+                continue
+            locus_calls[gene][tool].append(allele)
+
+    return locus_calls
+
+
+# ── Core consensus logic ──────────────────────────────────────────────────────
+
+def _consensus_for_gene(gene_label, tool_map, active_tools):
+    """
+    For one gene, run the tiered consensus:
+      1. Reduce all calls to 2-field for voting.
+      2. Count agreements.
+      3. Assign tier.
+      4. Select highest-resolution concordant call.
+    Returns a consensus record dict.
+    """
+    bare = gene_label[4:]  # strip HLA-
+
+    # Which tools actually typed this locus?
+    typed_tools   = {t: calls for t, calls in tool_map.items() if calls}
+    n_typed       = len(typed_tools)
+
+    # Which active tools were expected to cover this locus?
+    expected_tools = [t for t in active_tools
+                      if _tool_covers_locus(t, bare)]
+    n_expected     = len(expected_tools)
+
+    if n_typed == 0:
+        return _make_record(gene_label, "NONE", [], tool_map,
+                            "No tool produced a call at this locus.",
+                            n_typed, n_expected)
+
+    # Build vote map: 2-field allele -> [tools that called it]
+    vote_map = defaultdict(list)   # 2f_allele -> [tool, ...]
+    # Also keep the best full-resolution call per (2f, tool)
+    best_full = {}                 # (2f_allele, tool) -> highest-res allele
+
+    for tool, calls in typed_tools.items():
+        for allele in calls:
+            two_f = _to_2field(allele)
+            if two_f:
+                vote_map[two_f].append(tool)
+                key = (two_f, tool)
+                prev = best_full.get(key)
+                if prev is None or _field_count(allele) > _field_count(prev):
+                    best_full[key] = allele
+
+    # Find the winning 2-field call(s)
+    if not vote_map:
+        return _make_record(gene_label, "NONE", [], tool_map,
+                            "Alleles present but could not be reduced to 2-field.",
+                            n_typed, n_expected)
+
+    max_votes = max(len(v) for v in vote_map.values())
+
+    # Check for complete disagreement: every tool called something different
+    # (only meaningful when ≥2 tools typed the locus)
+    all_disagree = (n_typed >= 2 and
+                    all(len(v) == 1 for v in vote_map.values()) and
+                    len(vote_map) == n_typed)
+
+    if all_disagree:
+        # Build detailed disagreement info
+        disagreement = {t: [_to_2field(a) for a in calls]
+                        for t, calls in typed_tools.items()}
+        return _make_record(
+            gene_label, "MANUAL", [], tool_map,
+            f"All tools disagree — requires human adjudication. "
+            f"Calls: {disagreement}",
+            n_typed, n_expected,
+            disagreement=disagreement)
+
+    # Winning 2-field allele(s) = those with max votes
+    winners = [tf for tf, votes in vote_map.items()
+               if len(votes) == max_votes]
+
+    # Assign tier
+    if max_votes == n_expected:
+        tier = "HIGH"      # all expected tools agree
+    elif max_votes >= 2:
+        tier = "MEDIUM"    # majority agree
+    else:
+        tier = "LOW"       # singleton call
+
+    # Resolution selection: for each winning 2-field, find the best
+    # full-resolution call from any agreeing tool.
+    # OptiType is structurally 2-field — if it agrees with a 4-field call
+    # from another tool, the 4-field call wins.
+    pvac_alleles = []
+    resolution_notes = []
+    for two_f in winners:
+        agreeing_tools = vote_map[two_f]
+        # Collect all full-res calls from agreeing tools
+        candidate_calls = [best_full[(two_f, t)]
+                           for t in agreeing_tools
+                           if (two_f, t) in best_full]
+        # Pick highest field count
+        best = max(candidate_calls, key=_field_count, default=two_f)
+        fc = _field_count(best)
+
+        # Normalise to HLA- prefix
+        if not best.startswith("HLA-"):
+            best = f"HLA-{best}"
+        pvac_alleles.append(best)
+
+        # Note if resolution is only 2-field
+        if fc == 2:
+            contributing = [t for t in agreeing_tools
+                            if TOOL_META.get(t, {}).get("max_resolution", 4) > 2]
+            if contributing:
+                resolution_notes.append(
+                    f"{two_f}: only 2-field available despite 4-field-capable tools "
+                    f"({', '.join(contributing)}). "
+                    f"Check tool output quality for this locus.")
+            else:
+                resolution_notes.append(
+                    f"{two_f}: 2-field only (expected — OptiType structural limit).")
+
+    note = (f"Tier={tier}, votes={max_votes}/{n_expected}. "
+            + (" | ".join(resolution_notes) if resolution_notes else ""))
+
+    return _make_record(gene_label, tier, pvac_alleles, tool_map, note,
+                        n_typed, n_expected)
+
+
+# ── Output writers ────────────────────────────────────────────────────────────
+
+def _write_manual_review_tsv(path, manual_loci, sample_id, hla_input_source):
+    cols = ["sample_id", "gene", "hla_input_source",
+            "tool_calls", "reason", "action_required"]
+    with open(path, "w") as fh:
+        fh.write("# HLA Manual Review — loci requiring human adjudication\n")
+        fh.write("# These loci were EXCLUDED from the pVACtools allele string.\n")
+        fh.write("# A qualified scientist must review and select the correct allele.\n")
+        fh.write("#\n")
+        fh.write("\t".join(cols) + "\n")
+        for rec in manual_loci:
+            tool_calls_str = "; ".join(
+                f"{t}={','.join(calls)}"
+                for t, calls in rec.get("tool_map_raw", {}).items()
+                if calls)
+            fh.write("\t".join([
+                sample_id,
+                rec["gene"],
+                hla_input_source,
+                tool_calls_str,
+                rec.get("note", ""),
+                "Select correct allele and add manually to pVACtools --allele string"
+            ]) + "\n")
+
+
+def _write_consensus_json(path, sample_id, consensus_results,
+                          active_tools, failed_tools,
+                          hla_input_source, pvac_str, manual_review):
+    counts = {t: sum(1 for r in consensus_results.values() if r["tier"] == t)
+              for t in ("HIGH", "MEDIUM", "LOW", "MANUAL", "NONE")}
+    doc = {
+        "schema_version":   "2.0",
+        "sample_id":        sample_id,
+        "generated_utc":    datetime.now(timezone.utc).isoformat(),
+        "hla_input_source": hla_input_source,
+        "active_tools":     active_tools,
+        "failed_tools":     failed_tools,
+        "pvac_allele_string": pvac_str,
+        "tier_counts":      counts,
+        "manual_review_loci": [r["gene"] for r in manual_review],
+        "loci":             consensus_results,
+    }
+    with open(path, "w") as fh:
+        json.dump(doc, fh, indent=2)
+
+
+def _print_summary(sample_id, pvac_alleles, pvac_str, pvac_file,
+                   manual_review, nc_alleles, active_tools, hla_input_source):
+    w = 62
+    print(f"\n{'='*w}")
+    print(f"  CONSENSUS HLA ALLELES  —  {sample_id}")
+    print(f"{'='*w}")
+    print(f"  Tools used   : {', '.join(active_tools)}")
+    print(f"  Input source : {hla_input_source}")
+    print(f"  Legend       : ✓ HIGH  ~ MEDIUM  ⚠ LOW  ✗ MANUAL (excluded)")
+    print(f"{'─'*w}")
+
+    if not pvac_alleles:
+        print(f"  [CRITICAL] No alleles passed consensus — check tool outputs.")
+    else:
+        for i, a in enumerate(pvac_alleles, 1):
+            print(f"  {i:>2}. {a}")
+
+    print(f"\n{'─'*w}")
+    print(f"  pVACtools --allele string:\n\n    {pvac_str}\n")
+
+    if manual_review:
+        print(f"  ⚠  {len(manual_review)} locus/loci EXCLUDED (manual review required):")
+        for r in manual_review:
+            print(f"     ✗  {r['gene']}  —  {r.get('note', '')}")
+        print(f"     See: {sample_id}_hla_manual_review.tsv")
+    else:
+        print(f"  ✓  No loci require manual review.")
+
+    if nc_alleles:
+        print(f"\n  Non-classical (not in pVACtools string):")
+        for r in nc_alleles:
+            for a in r.get("pvac_alleles", []):
+                print(f"     {r['gene']}: {a}  [{r['tier']}]")
+
+    print(f"\n  Saved: {pvac_file}")
+    print(f"{'='*w}\n")
+
+
+# ── Utility functions ─────────────────────────────────────────────────────────
+
+def _make_record(gene, tier, pvac_alleles, tool_map, note,
+                 n_typed, n_expected, disagreement=None):
+    return {
+        "gene":          gene,
+        "tier":          tier,
+        "pvac_alleles":  pvac_alleles,
+        "n_typed":       n_typed,
+        "n_expected":    n_expected,
+        "note":          note,
+        "tool_map_raw":  {t: calls for t, calls in tool_map.items()},
+        "disagreement":  disagreement,
+    }
+
+
+def _extract_bare_gene(allele):
+    """HLA-A*02:01 -> A,  A*02:01 -> A,  HLA-DRB1*01:01 -> DRB1"""
+    a = allele.strip()
+    if not a:
+        return None
+    bare = a[4:] if a.upper().startswith("HLA-") else a
+    if "*" not in bare:
+        return None
+    return bare.split("*")[0]
+
+
+def _to_2field(allele):
+    """HLA-A*02:01:01:01 -> HLA-A*02:01"""
+    a = allele.strip()
+    bare = a[4:] if a.upper().startswith("HLA-") else a
+    if "*" not in bare:
+        return None
+    gene, rest = bare.split("*", 1)
+    parts = rest.split(":")
+    if len(parts) < 2:
+        return None
+    return f"HLA-{gene}*{parts[0]}:{parts[1]}"
+
+
+def _field_count(allele):
+    """Number of colon-separated fields after the asterisk."""
+    if not allele or "*" not in allele:
+        return 0
+    return allele.split("*", 1)[1].count(":") + 1
+
+
+def _tool_covers_locus(tool, bare_gene):
+    if tool == "optitype":
+        return bare_gene in MHC1_GENES
+    if tool == "arcasHLA":
+        return bare_gene in MHC1_GENES | MHC2_GENES
+    if tool == "hlahd":
+        return bare_gene in MHC1_GENES | MHC2_GENES | MHC_NC_GENES
+    return False
+
+
+def _format_calls(tool_map):
+    return "  |  ".join(
+        f"{t}: {','.join(_to_2field(a) or a for a in calls)}"
+        for t, calls in tool_map.items() if calls)
+
+
+if __name__ == "__main__":
+    main()
