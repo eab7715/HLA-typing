@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""
+_hla_concordance.py  —  HLA allele concordance table generator
+Called by generate_concordance_table() in the HLA typing pipeline.
+
+Usage:
+    python3 _hla_concordance.py <out_dir> <sample_id> <mhc_mode> \
+                                <mhc1_tool> <mhc2_tool> <hla_input_source>
+
+Output TSV columns:
+    gene            — locus (e.g. HLA-A, HLA-DRB1)
+    allele_2field   — canonical 2-field form used for voting
+    allele_full     — highest-resolution call available
+    tools_called    — pipe-separated list of tools that called this allele
+    n_tools_agree   — number of tools that agree on this 2-field call
+    n_tools_total   — number of tools that typed this locus
+    confidence      — HIGH (all agree) / MEDIUM (majority) / LOW (singleton)
+    discordant      — TRUE / FALSE
+    notes           — free-text flag (e.g. "locus not typed by arcasHLA")
+    hla_input_source— germline / tumour / unknown
+"""
+
+import sys, os, json
+from collections import defaultdict
+from datetime import datetime, timezone
+
+
+def main():
+    if len(sys.argv) < 7:
+        print("Usage: _hla_concordance.py out_dir sample_id mhc_mode "
+              "mhc1_tool mhc2_tool hla_input_source")
+        sys.exit(1)
+
+    out_dir, sample_id, mhc_mode, mhc1_tool, mhc2_tool, hla_input_source = sys.argv[1:7]
+    tsv_out  = os.path.join(out_dir, f"{sample_id}_hla_concordance.tsv")
+    json_out = os.path.join(out_dir, f"{sample_id}_hla_concordance.json")
+
+    # ── Collect per-tool allele files ────────────────────────────
+    # Map: tool_label -> list of allele strings
+    # Always load every tool whose allele file exists — allows consensus
+    # across all three tools regardless of which was specified as mhc1/mhc2.
+    tool_files = {}
+
+    optitype_f = os.path.join(out_dir, f"{sample_id}_optitype_alleles.txt")
+    if os.path.isfile(optitype_f):
+        tool_files['OptiType'] = _read_alleles(optitype_f)
+
+    arcashla_f = os.path.join(out_dir, f"{sample_id}_arcasHLA_alleles.txt")
+    if os.path.isfile(arcashla_f):
+        tool_files['arcasHLA'] = _read_alleles(arcashla_f)
+
+    hlahd_mhc1 = _read_alleles(os.path.join(out_dir, f"{sample_id}_hlahd_alleles.txt"))
+    hlahd_mhc2 = _read_alleles(os.path.join(out_dir, f"{sample_id}_hlahd_mhc2_alleles.txt"))
+    hlahd_nc   = _read_alleles(os.path.join(out_dir, f"{sample_id}_hlahd_nc_alleles.txt"))
+    hlahd_all  = list(set(hlahd_mhc1 + hlahd_mhc2 + hlahd_nc))
+    if hlahd_all:
+        tool_files['HLA-HD'] = hlahd_all
+
+    all_tools = list(tool_files.keys())
+
+    # ── Build locus → tool → alleles mapping ────────────────────
+    # locus_data[gene][tool] = list of 2-field alleles
+    locus_data = defaultdict(lambda: defaultdict(list))
+    # Also track full-resolution calls per tool per gene
+    locus_full  = defaultdict(lambda: defaultdict(list))
+
+    for tool, alleles in tool_files.items():
+        for allele in alleles:
+            gene  = _extract_gene(allele)
+            two_f = _to_2field(allele)
+            if gene and two_f:
+                locus_data[gene][tool].append(two_f)
+                locus_full[gene][tool].append(allele)
+
+    # ── Build concordance rows ───────────────────────────────────
+    rows = []
+    for gene in sorted(locus_data.keys()):
+        # Determine which tools typed this locus
+        tools_at_locus = {t: locus_data[gene][t] for t in all_tools
+                          if locus_data[gene].get(t)}
+        n_total = len(tools_at_locus)
+
+        # Count agreements per 2-field allele
+        vote_counts = defaultdict(list)  # 2field -> [tool, ...]
+        for tool, calls in tools_at_locus.items():
+            for c in calls:
+                vote_counts[c].append(tool)
+
+        # Determine which alleles are discordant
+        # A locus is fully concordant if every tool reports the same set of 2-field alleles
+        all_call_sets = [frozenset(v) for v in tools_at_locus.values()]
+        locus_concordant = len(set(all_call_sets)) == 1 if all_call_sets else True
+
+        # Emit one row per unique 2-field allele call at this locus
+        emitted_alleles = set()
+        for two_f, agreeing_tools in sorted(vote_counts.items()):
+            n_agree = len(agreeing_tools)
+            if n_total == 0:
+                confidence = "NONE"
+            elif n_agree == n_total:
+                confidence = "HIGH"
+            elif n_agree >= max(2, n_total // 2 + 1):
+                confidence = "MEDIUM"
+            else:
+                confidence = "LOW"
+
+            discordant = "TRUE" if not locus_concordant else "FALSE"
+
+            # Best full-resolution allele = longest call among agreeing tools
+            full_calls = []
+            for t in agreeing_tools:
+                full_calls.extend(locus_full[gene].get(t, []))
+            # Pick the call with the most fields (highest resolution)
+            allele_full = max(full_calls, key=lambda x: x.count(':'), default=two_f)
+
+            # Notes
+            non_typing_tools = [t for t in all_tools if t not in tools_at_locus]
+            notes_parts = []
+            if non_typing_tools:
+                notes_parts.append(f"not typed by: {','.join(non_typing_tools)}")
+            if gene in ('HLA-E', 'HLA-F', 'HLA-G'):
+                notes_parts.append("non-classical — excluded from pVACtools string")
+            notes = "; ".join(notes_parts) if notes_parts else ""
+
+            rows.append({
+                "gene":             gene,
+                "allele_2field":    two_f,
+                "allele_full":      allele_full,
+                "tools_called":     "|".join(sorted(agreeing_tools)),
+                "n_tools_agree":    n_agree,
+                "n_tools_total":    n_total,
+                "confidence":       confidence,
+                "discordant":       discordant,
+                "notes":            notes,
+                "hla_input_source": hla_input_source,
+            })
+            emitted_alleles.add(two_f)
+
+    # ── Write TSV ────────────────────────────────────────────────
+    cols = ["gene", "allele_2field", "allele_full", "tools_called",
+            "n_tools_agree", "n_tools_total", "confidence", "discordant",
+            "notes", "hla_input_source"]
+
+    with open(tsv_out, 'w') as fh:
+        fh.write("# HLA Allele Concordance Table\n")
+        fh.write(f"# sample_id: {sample_id}\n")
+        fh.write(f"# generated_utc: {datetime.now(timezone.utc).isoformat()}\n")
+        fh.write(f"# tools: {', '.join(all_tools)}\n")
+        fh.write(f"# hla_input_source: {hla_input_source}\n")
+        fh.write(f"# confidence key: HIGH=all tools agree | MEDIUM=majority agree | LOW=singleton\n")
+        fh.write("#\n")
+        fh.write("\t".join(cols) + "\n")
+        for row in rows:
+            fh.write("\t".join(str(row[c]) for c in cols) + "\n")
+
+    # ── Write JSON (for module 3 programmatic access) ────────────
+    summary = {
+        "sample_id":        sample_id,
+        "generated_utc":    datetime.now(timezone.utc).isoformat(),
+        "hla_input_source": hla_input_source,
+        "tools":            all_tools,
+        "total_alleles":    len(rows),
+        "high_confidence":  sum(1 for r in rows if r["confidence"] == "HIGH"),
+        "medium_confidence":sum(1 for r in rows if r["confidence"] == "MEDIUM"),
+        "low_confidence":   sum(1 for r in rows if r["confidence"] == "LOW"),
+        "discordant_loci":  list({r["gene"] for r in rows if r["discordant"] == "TRUE"}),
+        "alleles":          rows,
+    }
+    with open(json_out, 'w') as fh:
+        json.dump(summary, fh, indent=2)
+
+    # ── Console summary ──────────────────────────────────────────
+    w = 60
+    print(f"\n{'='*w}")
+    print(f"  HLA CONCORDANCE TABLE  —  {sample_id}")
+    print(f"{'='*w}")
+    print(f"  Tools compared  : {', '.join(all_tools)}")
+    print(f"  Total alleles   : {len(rows)}")
+    print(f"  HIGH confidence : {summary['high_confidence']}")
+    print(f"  MEDIUM          : {summary['medium_confidence']}")
+    print(f"  LOW             : {summary['low_confidence']}")
+    if summary['discordant_loci']:
+        print(f"\n  ⚠  Discordant loci (manual review recommended):")
+        for g in sorted(summary['discordant_loci']):
+            disc_rows = [r for r in rows if r['gene'] == g]
+            for r in disc_rows:
+                print(f"     {g}: {r['allele_2field']}  ({r['tools_called']})  [{r['confidence']}]")
+    else:
+        print(f"\n  ✓  All loci concordant across tools.")
+    print(f"\n  TSV : {tsv_out}")
+    print(f"  JSON: {json_out}")
+    print(f"{'='*w}\n")
+
+
+def _read_alleles(path, gene_filter=None):
+    """Read non-comment, non-blank lines from an allele file."""
+    if not os.path.isfile(path):
+        return []
+    alleles = []
+    with open(path) as fh:
+        for line in fh:
+            a = line.strip()
+            if not a or a.startswith('#'):
+                continue
+            if gene_filter:
+                bare = a[4:] if a.upper().startswith('HLA-') else a
+                if not any(bare.startswith(g) for g in gene_filter):
+                    continue
+            alleles.append(a)
+    return alleles
+
+
+def _extract_gene(allele):
+    """
+    Extract the gene name from an allele string.
+    HLA-A*02:01  ->  HLA-A
+    A*02:01      ->  HLA-A
+    """
+    a = allele.strip()
+    if '*' not in a:
+        return None
+    bare = a[4:] if a.upper().startswith('HLA-') else a
+    gene = bare.split('*')[0]
+    return f"HLA-{gene}"
+
+
+def _to_2field(allele):
+    """
+    Reduce an allele to 2-field (G-group level) resolution.
+    HLA-A*02:01:01:01  ->  HLA-A*02:01
+    A*02:01            ->  HLA-A*02:01
+    """
+    a = allele.strip()
+    bare = a[4:] if a.upper().startswith('HLA-') else a
+    if '*' not in bare:
+        return None
+    gene, fields_str = bare.split('*', 1)
+    fields = fields_str.split(':')
+    if len(fields) < 2:
+        return None
+    return f"HLA-{gene}*{fields[0]}:{fields[1]}"
+
+
+if __name__ == "__main__":
+    main()
